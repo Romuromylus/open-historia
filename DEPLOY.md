@@ -52,6 +52,7 @@ sent to any browser):
 | `LLM_API_KEY`   | yes      | Bearer key for that endpoint. Injected server-side at relay.   |
 | `LLM_MODEL`     | strongly recommended | Model id, e.g. `gpt-4o-mini`. If omitted, the client tries `/models` discovery. |
 | `LLM_DISABLE_REASONING` | no | Set to `1` if your endpoint rejects the `reasoning_effort` field — the relay strips it. |
+| `LLM_MAX_TOKENS` | no | Completion budget injected into chat calls that don't set one (default `16384`; `0` disables). Prevents long turns from being truncated into unparseable JSON by a gateway's small default cap. |
 | `PORT`          | no       | Defaults to `3000`.                                            |
 
 Managed mode turns on only when both `LLM_BASE_URL` and `LLM_API_KEY` are set.

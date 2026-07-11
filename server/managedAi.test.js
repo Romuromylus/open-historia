@@ -19,7 +19,22 @@ test("readManagedAiConfig enables only with both base URL and key", () => {
   assert.equal(readManagedAiConfig({ LLM_API_KEY: "k" }).enabled, false);
 
   const cfg = readManagedAiConfig({ LLM_BASE_URL: "https://x/v1", LLM_API_KEY: "k", LLM_MODEL: "m" });
-  assert.deepEqual(cfg, { baseUrl: "https://x/v1", apiKey: "k", model: "m", disableReasoning: false, enabled: true });
+  assert.deepEqual(cfg, {
+    baseUrl: "https://x/v1",
+    apiKey: "k",
+    model: "m",
+    disableReasoning: false,
+    maxTokens: 16384,
+    enabled: true,
+  });
+});
+
+test("readManagedAiConfig reads LLM_MAX_TOKENS (default 16384, 0 disables, junk disables)", () => {
+  const env = { LLM_BASE_URL: "https://x", LLM_API_KEY: "k" };
+  assert.equal(readManagedAiConfig(env).maxTokens, 16384);
+  assert.equal(readManagedAiConfig({ ...env, LLM_MAX_TOKENS: "32000" }).maxTokens, 32000);
+  assert.equal(readManagedAiConfig({ ...env, LLM_MAX_TOKENS: "0" }).maxTokens, 0);
+  assert.equal(readManagedAiConfig({ ...env, LLM_MAX_TOKENS: "lots" }).maxTokens, 0);
 });
 
 test("readManagedAiConfig reads LLM_DISABLE_REASONING", () => {
@@ -122,6 +137,28 @@ test("applyManagedRelay keeps reasoning_effort when reasoning is not disabled", 
     ENABLED,
   );
   assert.equal(out.payload.reasoning_effort, "medium");
+});
+
+test("applyManagedRelay injects the completion budget when the chat payload has none", () => {
+  const cfg = { ...ENABLED, maxTokens: 16384 };
+  const out = applyManagedRelay({ url: CHAT_URL, headers: {}, payload: { model: "orig", messages: [] } }, cfg);
+  assert.equal(out.payload.max_tokens, 16384);
+});
+
+test("applyManagedRelay never overrides a caller-provided completion cap (either spelling)", () => {
+  const cfg = { ...ENABLED, maxTokens: 16384 };
+  const explicit = applyManagedRelay({ url: CHAT_URL, headers: {}, payload: { max_tokens: 512 } }, cfg);
+  assert.equal(explicit.payload.max_tokens, 512);
+  const modern = applyManagedRelay({ url: CHAT_URL, headers: {}, payload: { max_completion_tokens: 512 } }, cfg);
+  assert.equal(modern.payload.max_completion_tokens, 512);
+  assert.equal("max_tokens" in modern.payload, false);
+});
+
+test("applyManagedRelay skips the budget when disabled (maxTokens 0) and on GET /models", () => {
+  const off = applyManagedRelay({ url: CHAT_URL, headers: {}, payload: { model: "x" } }, { ...ENABLED, maxTokens: 0 });
+  assert.equal("max_tokens" in off.payload, false);
+  const models = applyManagedRelay({ url: MODELS_URL, headers: {}, method: "GET" }, { ...ENABLED, maxTokens: 16384 });
+  assert.equal(models.payload, undefined);
 });
 
 test("applyManagedRelay tolerates an unparseable URL", () => {

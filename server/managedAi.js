@@ -42,7 +42,15 @@ export function readManagedAiConfig(env = process.env) {
   // default; a strict gateway/model that rejects unknown fields would 400 every
   // call, and in managed mode the operator otherwise has no way to turn it off.
   const disableReasoning = String(env.LLM_DISABLE_REASONING ?? "").trim() === "1";
-  return { baseUrl, apiKey, model, disableReasoning, enabled: Boolean(baseUrl && apiKey) };
+  // Completion budget injected into chat calls that don't set one themselves.
+  // The game's client never sends max_tokens on OpenAI-compatible calls, so a
+  // gateway with a small default cap truncates long turns (a year-long jump is
+  // 30+ events of JSON) — the cut-off JSON fails to parse and the turn silently
+  // degrades to the canned fallback. LLM_MAX_TOKENS overrides; 0 disables.
+  const rawMaxTokens = String(env.LLM_MAX_TOKENS ?? "").trim();
+  const parsedMaxTokens = Number.parseInt(rawMaxTokens, 10);
+  const maxTokens = rawMaxTokens === "" ? 16384 : Number.isFinite(parsedMaxTokens) && parsedMaxTokens > 0 ? parsedMaxTokens : 0;
+  return { baseUrl, apiKey, model, disableReasoning, maxTokens, enabled: Boolean(baseUrl && apiKey) };
 }
 
 // The client-facing view of the config: whether a managed endpoint exists and,
@@ -93,6 +101,11 @@ export function applyManagedRelay({ url, headers = {}, payload, method = "POST" 
     if (config.disableReasoning && nextPayload && "reasoning_effort" in nextPayload) {
       nextPayload = { ...nextPayload };
       delete nextPayload.reasoning_effort;
+    }
+    // Give completions room when the caller didn't ask for a budget itself —
+    // see readManagedAiConfig. A caller-provided cap (either spelling) wins.
+    if (config.maxTokens > 0 && !("max_tokens" in nextPayload) && !("max_completion_tokens" in nextPayload)) {
+      nextPayload = { ...nextPayload, max_tokens: config.maxTokens };
     }
     result.payload = nextPayload;
   }

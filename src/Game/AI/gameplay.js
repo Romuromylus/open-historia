@@ -249,6 +249,22 @@ const buildTerritorySummary = async (world) => {
   return lines.join("\n");
 };
 
+// game.country stores the polity CODE ("GER"); prose shown to the player (and
+// every prompt that says "you are playing as ...") should use the display name
+// ("Germany"). Scenario polity overrides win, then the stock country catalog,
+// then the code itself as a last resort.
+const resolvePolityDisplayName = async (code, world) => {
+  const normalizedCode = normalizeString(code);
+  if (!normalizedCode) return "Unknown polity";
+  const override = normalizeWorldState(world).polityOverrides[normalizedCode];
+  if (override?.name) return override.name;
+  const countries = await loadCountryNames().catch(() => []);
+  const match = countries.find(
+    (country) => normalizeString(country.code).toLowerCase() === normalizedCode.toLowerCase(),
+  );
+  return match?.name || normalizedCode;
+};
+
 const buildWorldSummary = async (bundle) => {
   const territorySummary = await buildTerritorySummary(bundle.world);
   const polityOverrides = Object.values(normalizeWorldState(bundle.world).polityOverrides);
@@ -269,8 +285,9 @@ const buildWorldSummary = async (bundle) => {
     ? `Active catalyst: ${activeCatalyst.title || "untitled"} - ${activeCatalyst.premise || activeCatalyst.opening || ""}`
     : "No active catalyst scene.";
 
+  const playerName = await resolvePolityDisplayName(bundle.game.country, bundle.world);
   return [
-    `Player polity: ${bundle.game.country || "Unknown polity"}`,
+    `Player polity: ${playerName}${bundle.game.country ? ` (code ${bundle.game.country})` : ""}`,
     `Current round: ${bundle.game.round}`,
     `Current date: ${bundle.game.gameDate || "unknown"}`,
     `Language: ${bundle.world.language || bundle.game.language || "English"}`,
@@ -528,7 +545,7 @@ const buildTemplateVariables = async (
     lastSpeaker,
     numberOfRegions: String(regionCatalog.length),
     plannedActions: buildActionHistoryText(bundle.actions),
-    playerPolity: bundle.game.country || "Unknown polity",
+    playerPolity: await resolvePolityDisplayName(bundle.game.country, bundle.world),
     playerBattalionSummaries: buildUnitsSummaryText(bundle.world),
     // Simulation tasks additionally get the reach/logistics doctrine — but
     // only when forces are actually in play this turn (see the builder).
@@ -580,7 +597,7 @@ const withTimeout = async (promise, timeoutMs, timeoutMessage) => {
 // need well over a minute per turn. The old 12s default silently discarded
 // their answers and served the canned fallback instead — turns "completed"
 // with nothing to show. The UI has spinners; waiting beats silently wrong.
-const runJsonTask = async (taskKey, { fallback, timeoutMs = 120000, userMessage, variables }) => {
+const runJsonTask = async (taskKey, { fallback, timeoutMs = 240000, userMessage, variables }) => {
   const prompts = await loadPromptCatalog();
   const helperValues = resolveHelperValues(prompts.helpers, variables);
   let systemPrompt = renderTemplate(prompts.tasks[taskKey], {
@@ -611,7 +628,18 @@ const runJsonTask = async (taskKey, { fallback, timeoutMs = 120000, userMessage,
     console.warn(`[ai] task "${taskKey}" failed (${error?.message || error}) — using the deterministic fallback.`);
   }
 
-  return fallback();
+  // Tag fallback payloads (non-enumerable, so it never serializes into saves):
+  // callers can tell the player the AI didn't actually run instead of passing
+  // canned events off as a real turn.
+  const fallbackPayload = await fallback();
+  if (fallbackPayload && typeof fallbackPayload === "object") {
+    try {
+      Object.defineProperty(fallbackPayload, "__fallback", { value: true });
+    } catch {
+      // frozen/exotic payloads still work, just untagged
+    }
+  }
+  return fallbackPayload;
 };
 
 const mergePolityCatalog = (countryCatalog, world) => {
@@ -675,6 +703,7 @@ const inferInviteeNames = async (text, world, playerCountry = "") => {
 };
 
 const fallbackActionSuggestions = async (bundle) => {
+  const playerName = await resolvePolityDisplayName(bundle.game.country, bundle.world);
   const recentTitles = normalizeEvents(bundle.events).slice(-3).map((event) => event.title);
   const topics = DEFAULT_SUGGESTION_TOPICS.map((topic, index) => {
     const recentTitle = recentTitles[index];
@@ -688,7 +717,7 @@ const fallbackActionSuggestions = async (bundle) => {
       normalizeActionEntry({
         kind: "action",
         source: "suggested",
-        text: `Prepare a second-order measure that protects ${bundle.game.country || "the polity"} if this line of effort triggers resistance.`,
+        text: `Prepare a second-order measure that protects ${playerName} if this line of effort triggers resistance.`,
         title: "Create a contingency layer",
       }),
     ].filter(Boolean);
@@ -708,7 +737,8 @@ const fallbackDescriptionToAction = async (rawInput, bundle) => {
   const trimmed = normalizeString(rawInput);
   const isChat = CHAT_HINT_PATTERNS.some((pattern) => pattern.test(trimmed));
   const inferredInvitees = isChat
-    ? await inferInviteeNames(trimmed, bundle.world, bundle.game.country)
+    ? // inferInviteeNames excludes the player by display NAME; the raw code never matched.
+      await inferInviteeNames(trimmed, bundle.world, await resolvePolityDisplayName(bundle.game.country, bundle.world))
     : [];
   const title = sentenceCase(trimmed.split(/[.!?]/)[0] || trimmed);
   const expandedText = isChat
@@ -790,6 +820,7 @@ const buildGeneratedChat = async (chatLike, linkEventId, world) => {
 };
 
 const fallbackJumpSimulation = async ({ bundle, days, mode, targetDate }) => {
+  const playerName = await resolvePolityDisplayName(bundle.game.country, bundle.world);
   const plannedActions = normalizeActions(bundle.actions).filter((action) => action.status === "planned");
   const firstThreeActions = plannedActions.slice(0, 3);
   const events = [];
@@ -812,8 +843,8 @@ const fallbackJumpSimulation = async ({ bundle, days, mode, targetDate }) => {
         date: eventDate,
         description:
           action.kind === "chat"
-            ? `${bundle.game.country} opens a deliberate diplomatic channel tied to ${action.title.toLowerCase()}, forcing counterparts to weigh terms instead of guessing intent.`
-            : `${bundle.game.country} begins implementing ${action.title.toLowerCase()}, producing immediate administrative and political consequences that other powers start to notice.`,
+            ? `${playerName} opens a deliberate diplomatic channel tied to ${action.title.toLowerCase()}, forcing counterparts to weigh terms instead of guessing intent.`
+            : `${playerName} begins implementing ${action.title.toLowerCase()}, producing immediate administrative and political consequences that other powers start to notice.`,
         impacts: {
           createdChats:
             action.kind === "chat" && action.invitees.length > 0 && action.chatStarter
@@ -821,7 +852,7 @@ const fallbackJumpSimulation = async ({ bundle, days, mode, targetDate }) => {
                   {
                     countries: action.invitees,
                     openingMessage: action.chatStarter,
-                    speaker: bundle.game.country,
+                    speaker: playerName,
                     title: action.title,
                   },
                 ]
@@ -835,15 +866,15 @@ const fallbackJumpSimulation = async ({ bundle, days, mode, targetDate }) => {
         playerRelated: true,
         title:
           action.kind === "chat"
-            ? `${bundle.game.country} opens a diplomatic channel`
-            : `${bundle.game.country} acts on ${action.title.toLowerCase()}`,
+            ? `${playerName} opens a diplomatic channel`
+            : `${playerName} acts on ${action.title.toLowerCase()}`,
       });
     });
   } else {
     const midpoint = advanceGameDate(Math.max(1, Math.round(Math.max(days, 1) / 2)));
     events.push({
       date: midpoint,
-      description: `Foreign ministries and general staffs keep adjusting to the current balance of power while ${bundle.game.country} gathers its next move.`,
+      description: `Foreign ministries and general staffs keep adjusting to the current balance of power while ${playerName} gathers its next move.`,
       impacts: {
         createdChats: [],
         polityChanges: [],
@@ -878,8 +909,8 @@ const fallbackJumpSimulation = async ({ bundle, days, mode, targetDate }) => {
     stopDate: targetDate,
     summary:
       plannedActions.length > 0
-        ? `${bundle.game.country} moves from planning into execution, and the world begins adjusting to the turn's most concrete orders.`
-        : `Time advances without a direct order from ${bundle.game.country}, but the wider system keeps shifting and building pressure.`,
+        ? `${playerName} moves from planning into execution, and the world begins adjusting to the turn's most concrete orders.`
+        : `Time advances without a direct order from ${playerName}, but the wider system keeps shifting and building pressure.`,
   };
 };
 
@@ -1084,7 +1115,15 @@ export const generateActionSuggestions = async ({ force = true } = {}) => {
   const variables = await buildTemplateVariables(bundle);
   const payload = await runJsonTask("actions", {
     fallback: () => fallbackActionSuggestions(bundle),
-    userMessage: "Generate current strategic action suggestions as JSON only.",
+    // The action history rides in the user message (not the editable prompt
+    // pack) so scenario-bundled prompts can't lose it: without it the model
+    // re-suggests moves the player already made, turn after turn.
+    userMessage:
+      "Generate current strategic action suggestions as JSON only. " +
+      "Propose FRESH, forward-looking options: never re-suggest an action the player has already taken or queued " +
+      "(full history below), and do not rehash topics the event history shows as settled — advance to the NEXT " +
+      "decision each concern calls for. Use polity display names, never internal codes, in all titles and descriptions.\n\n" +
+      `PLAYER ACTION HISTORY (do not repeat any of these):\n${variables.allActions}`,
     variables,
   });
 
@@ -1564,7 +1603,10 @@ const REGION_TRANSFER_CONTRACT =
   "Emit one entry for EVERY region that changes hands: " +
   '{"regionId":"<exact map region id if known, else empty>","regionName":"<the region\'s name>","fromCode":"<current owner code>","toCode":"<new owner code>"}. ' +
   "Region names are resolved to map regions automatically, so an exact name is enough; " +
-  "to transfer a polity's entire territory, put the polity or country name in regionName.";
+  "to transfer a polity's entire territory, put the polity or country name in regionName. " +
+  "In every human-readable string (summary, event titles and descriptions, chat messages) refer to polities by their " +
+  "display names (e.g. \"Germany\"), NEVER by internal codes (e.g. \"GER\") — codes belong only in machine fields " +
+  "(regionId, fromCode, toCode, ownerCode, code).";
 
 export const simulateTimelineJump = async ({ days, mode = "jump" } = {}) => {
   const bundle = await readGameStateBundle({ force: true });
@@ -1586,8 +1628,10 @@ export const simulateTimelineJump = async ({ days, mode = "jump" } = {}) => {
   let payload = await runJsonTask(mode === "auto" ? "autoJumpForward" : "jumpForward", {
     fallback: () => fallbackJumpSimulation({ bundle, days: safeDays, mode, targetDate }),
     // The jump IS the game — let slow (local/reasoning) models finish instead
-    // of silently swapping in the canned fallback after a few seconds.
-    timeoutMs: 180000,
+    // of silently swapping in the canned fallback after a few seconds. A
+    // long jump can legitimately demand 30+ events of JSON from a reasoning
+    // model, which routinely takes several minutes.
+    timeoutMs: 420000,
     userMessage:
       (mode === "auto"
         ? "Simulate an auto-jump and stop at the next notable or player-relevant event. Return JSON only. " +
@@ -1612,15 +1656,27 @@ export const simulateTimelineJump = async ({ days, mode = "jump" } = {}) => {
   if (emptyTurn) {
     console.warn("[ai] jump returned an empty turn — using the deterministic fallback.");
     payload = await fallbackJumpSimulation({ bundle, days: safeDays, mode, targetDate });
+    try {
+      Object.defineProperty(payload, "__fallback", { value: true });
+    } catch {
+      // untagged is still a working turn
+    }
   }
 
+  // A fallback turn is a degraded turn (generic events, no real consequences).
+  // Say so instead of passing it off as the simulation — the player can then
+  // simply retry the jump rather than wonder why nothing "took".
+  const usedFallback = Boolean(payload?.__fallback);
   const result = {
     catalyst: payload?.catalyst ?? null,
     clearActions: payload?.clearActions !== false,
     events: normalizeArray(payload?.events),
     mode,
     stopDate: normalizeString(payload?.stopDate) || targetDate,
-    summary: normalizeString(payload?.summary),
+    summary:
+      (usedFallback
+        ? "⚠ The AI simulator did not answer this turn (timed out or returned unusable output), so a minimal placeholder turn was generated — your orders were NOT fully simulated. Consider rolling back or jumping again. "
+        : "") + normalizeString(payload?.summary),
   };
 
   return applySimulationResult({

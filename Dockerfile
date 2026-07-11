@@ -10,22 +10,26 @@
 FROM node:22-bookworm AS build
 WORKDIR /app
 
-# git-lfs materializes the LFS-tracked map binaries (pmtiles, seed geojson).
-RUN apt-get update \
-  && apt-get install -y --no-install-recommends git-lfs \
-  && rm -rf /var/lib/apt/lists/* \
-  && git lfs install --skip-repo
+# The map binaries are Git-LFS tracked. EasyPanel's build context has no .git and
+# doesn't smudge LFS, so `git lfs pull` can't run here — instead resolve-lfs.mjs
+# fetches each object straight from GitHub's media host by reading the pointer OID
+# (the deploy fork is public, so no credentials). GIT_SHA is the commit being built
+# (EasyPanel passes it); owner/repo default to the deploy fork and can be overridden.
+ARG GIT_SHA=pax-colonia
+ARG LFS_OWNER=Romuromylus
+ARG LFS_REPO=open-historia
 
 # Install deps first so this layer caches across code-only changes.
 COPY package.json package-lock.json ./
 RUN npm ci
 
-# The rest of the repo, including .git so LFS pointers can be resolved.
+# The rest of the repo (LFS pointer stubs included).
 COPY . .
 
-# Turn LFS pointer stubs into real bytes (a no-op if the checkout is already
-# smudged), then HARD-verify: a build that would ship a blank map fails here.
-RUN git lfs pull || true \
+# Resolve LFS pointers to real bytes from the media host, then HARD-verify: a build
+# that would ship a blank map fails here. resolve-lfs.mjs is a no-op for files that
+# are already real (e.g. a local build from an LFS-smudged working tree).
+RUN node scripts/resolve-lfs.mjs . "$LFS_OWNER" "$LFS_REPO" "$GIT_SHA" \
   && node scripts/verify-assets.mjs
 
 # Build the client bundle. The pmtiles vite copies into dist/assets are dead

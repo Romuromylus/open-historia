@@ -24,6 +24,6 @@ logs
 .DS_Store
 *.local
 
-# NOTE: .git is intentionally NOT ignored — the build stage needs it for
-# `git lfs pull`. It is only present in the build stage; the runtime stage
-# copies dist/, server/, and public/ but never .git.
+# LFS is resolved from the media host (scripts/resolve-lfs.mjs), not from .git,
+# so the build never needs the git history in its context.
+.git

@@ -24,9 +24,17 @@ test("readManagedAiConfig enables only with both base URL and key", () => {
     apiKey: "k",
     model: "m",
     disableReasoning: false,
+    reasoningEffort: "",
     maxTokens: 16384,
     enabled: true,
   });
+});
+
+test("readManagedAiConfig validates LLM_REASONING_EFFORT (low/medium/high only)", () => {
+  const env = { LLM_BASE_URL: "https://x", LLM_API_KEY: "k" };
+  assert.equal(readManagedAiConfig(env).reasoningEffort, "");
+  assert.equal(readManagedAiConfig({ ...env, LLM_REASONING_EFFORT: "Medium" }).reasoningEffort, "medium");
+  assert.equal(readManagedAiConfig({ ...env, LLM_REASONING_EFFORT: "maximum" }).reasoningEffort, "");
 });
 
 test("readManagedAiConfig reads LLM_MAX_TOKENS (default 16384, 0 disables, junk disables)", () => {
@@ -137,6 +145,20 @@ test("applyManagedRelay keeps reasoning_effort when reasoning is not disabled", 
     ENABLED,
   );
   assert.equal(out.payload.reasoning_effort, "medium");
+});
+
+test("applyManagedRelay pins the operator's reasoning level (set or override)", () => {
+  const cfg = { ...ENABLED, reasoningEffort: "high" };
+  const overridden = applyManagedRelay({ url: CHAT_URL, headers: {}, payload: { reasoning_effort: "medium" } }, cfg);
+  assert.equal(overridden.payload.reasoning_effort, "high");
+  const injected = applyManagedRelay({ url: CHAT_URL, headers: {}, payload: { messages: [] } }, cfg);
+  assert.equal(injected.payload.reasoning_effort, "high");
+});
+
+test("applyManagedRelay: LLM_DISABLE_REASONING wins over a pinned level", () => {
+  const cfg = { ...ENABLED, disableReasoning: true, reasoningEffort: "high" };
+  const out = applyManagedRelay({ url: CHAT_URL, headers: {}, payload: { reasoning_effort: "medium" } }, cfg);
+  assert.equal("reasoning_effort" in out.payload, false);
 });
 
 test("applyManagedRelay injects the completion budget when the chat payload has none", () => {

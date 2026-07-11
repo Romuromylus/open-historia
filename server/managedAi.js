@@ -42,6 +42,12 @@ export function readManagedAiConfig(env = process.env) {
   // default; a strict gateway/model that rejects unknown fields would 400 every
   // call, and in managed mode the operator otherwise has no way to turn it off.
   const disableReasoning = String(env.LLM_DISABLE_REASONING ?? "").trim() === "1";
+  // Or PIN the reasoning level for every browser (low/medium/high): thinking is
+  // a real quality/latency trade for turn simulation, and the operator — who
+  // knows the gateway's speed — is better placed to pick it than each player's
+  // localStorage toggle. Ignored when LLM_DISABLE_REASONING=1 strips it anyway.
+  const rawEffort = String(env.LLM_REASONING_EFFORT ?? "").trim().toLowerCase();
+  const reasoningEffort = ["low", "medium", "high"].includes(rawEffort) ? rawEffort : "";
   // Completion budget injected into chat calls that don't set one themselves.
   // The game's client never sends max_tokens on OpenAI-compatible calls, so a
   // gateway with a small default cap truncates long turns (a year-long jump is
@@ -50,7 +56,7 @@ export function readManagedAiConfig(env = process.env) {
   const rawMaxTokens = String(env.LLM_MAX_TOKENS ?? "").trim();
   const parsedMaxTokens = Number.parseInt(rawMaxTokens, 10);
   const maxTokens = rawMaxTokens === "" ? 16384 : Number.isFinite(parsedMaxTokens) && parsedMaxTokens > 0 ? parsedMaxTokens : 0;
-  return { baseUrl, apiKey, model, disableReasoning, maxTokens, enabled: Boolean(baseUrl && apiKey) };
+  return { baseUrl, apiKey, model, disableReasoning, reasoningEffort, maxTokens, enabled: Boolean(baseUrl && apiKey) };
 }
 
 // The client-facing view of the config: whether a managed endpoint exists and,
@@ -101,6 +107,9 @@ export function applyManagedRelay({ url, headers = {}, payload, method = "POST" 
     if (config.disableReasoning && nextPayload && "reasoning_effort" in nextPayload) {
       nextPayload = { ...nextPayload };
       delete nextPayload.reasoning_effort;
+    } else if (config.reasoningEffort) {
+      // Pin the operator-chosen level whether or not the browser sent one.
+      nextPayload = { ...nextPayload, reasoning_effort: config.reasoningEffort };
     }
     // Give completions room when the caller didn't ask for a budget itself —
     // see readManagedAiConfig. A caller-provided cap (either spelling) wins.

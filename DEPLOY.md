@@ -52,6 +52,7 @@ sent to any browser):
 | `LLM_API_KEY`   | yes      | Bearer key for that endpoint. Injected server-side at relay.   |
 | `LLM_MODEL`     | strongly recommended | Model id, e.g. `gpt-4o-mini`. If omitted, the client tries `/models` discovery. |
 | `LLM_DISABLE_REASONING` | no | Set to `1` if your endpoint rejects the `reasoning_effort` field — the relay strips it. |
+| `LLM_REASONING_EFFORT` | no | Pin the model's reasoning level (`low`/`medium`/`high`) for every browser, overriding each player's local toggle. Thinking improves turn quality but adds minutes of latency; pick what your gateway can serve within the game's turn timeout. Ignored if `LLM_DISABLE_REASONING=1`. |
 | `LLM_MAX_TOKENS` | no | Completion budget injected into chat calls that don't set one (default `16384`; `0` disables). Prevents long turns from being truncated into unparseable JSON by a gateway's small default cap. |
 | `PORT`          | no       | Defaults to `3000`.                                            |
 

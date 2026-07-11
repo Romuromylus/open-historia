@@ -37,6 +37,7 @@ import {
 import { difficultyDirective } from "../../runtime/difficulty.js";
 import { resolveExpansion } from "../../runtime/expansion.js";
 import { planAiTurn } from "../../runtime/aiTurn.js";
+import { resolveRegionTransfers } from "../../runtime/regionTransferResolver.js";
 
 const CHAT_HINT_PATTERNS = [
   /\bchat\b/i,
@@ -231,15 +232,21 @@ const buildTerritorySummary = async (world) => {
   const regionCatalog = await loadRegionCatalog();
   const regionLookup = new Map(regionCatalog.map((region) => [region.id, region]));
 
-  return regionOverrides
-    .slice(0, 24)
+  // Include the region ID next to each name: it is the only place the model
+  // sees the map's real id format, which grounds the regionId field of any
+  // regionTransfers it emits (names also resolve — see regionTransferResolver).
+  const lines = regionOverrides
+    .slice(0, 40)
     .map(([regionId, ownerCode]) => {
       const region = regionLookup.get(regionId);
       const regionName = region?.name || regionId;
       const countryName = region?.country ? ` (${region.country})` : "";
-      return `- ${regionName}${countryName} -> ${ownerCode}`;
-    })
-    .join("\n");
+      return `- ${regionName} [${regionId}]${countryName} -> ${ownerCode}`;
+    });
+  if (regionOverrides.length > lines.length) {
+    lines.push(`- …and ${regionOverrides.length - lines.length} more region override(s) not listed.`);
+  }
+  return lines.join("\n");
 };
 
 const buildWorldSummary = async (bundle) => {
@@ -960,6 +967,37 @@ const applySimulationResult = async ({
   const generatedEvents = normalizeArray(result.events)
     .map((entry, index) => normalizeGeneratedEvent(entry, index))
     .filter(Boolean);
+
+  // The model names territory; the map keys ownership by region id. Resolve
+  // every generated transfer against the region catalog (exact id, region
+  // name, or whole-polity expansion) so narrated conquests actually repaint
+  // the map. Ownership is threaded through event-by-event so a later "all of
+  // Poland" only moves what earlier events in the same turn left behind.
+  // Unresolvable entries are dropped — a dead override colors nothing anyway.
+  const regionCatalog = await loadRegionCatalog().catch(() => []);
+  if (regionCatalog.length > 0) {
+    const normalizedBaseWorld = normalizeWorldState(baseWorld);
+    const workingOwnership = { ...normalizedBaseWorld.regionOwnershipOverrides };
+    for (const event of generatedEvents) {
+      if (event.impacts.regionTransfers.length === 0) continue;
+      const { transfers, unresolved } = resolveRegionTransfers(event.impacts.regionTransfers, {
+        ownership: workingOwnership,
+        polityOverrides: normalizedBaseWorld.polityOverrides,
+        regions: regionCatalog,
+      });
+      if (unresolved.length > 0) {
+        console.warn(
+          `[ai] ${unresolved.length} region transfer(s) in "${event.title}" matched no map region and were skipped:`,
+          unresolved.map((entry) => entry?.regionName || entry?.regionId || "(unnamed)").join(", "),
+        );
+      }
+      event.impacts.regionTransfers = transfers;
+      for (const transfer of transfers) {
+        workingOwnership[transfer.regionId] = transfer.toCode;
+      }
+    }
+  }
+
   const nextEvents = [...normalizeEvents(baseEvents), ...generatedEvents];
   const nextGame = normalizeGameData({
     ...baseGame,
@@ -1515,6 +1553,19 @@ const applyDeterministicExpansion = async (bundle) => {
   return `This turn, ${resolved.ownershipChanges.length} territory change(s) occurred and are FINAL. ${lines.join(" ")}`;
 };
 
+// Rides along with every turn/GM request as part of the user message — NOT the
+// editable prompt pack, so a scenario that bundles its own prompts can't lose
+// it. Without this the model routinely narrates conquests in prose while the
+// borders stay frozen, or keys transfers on names the map doesn't recognize
+// (names DO resolve now — see runtime/regionTransferResolver.js — but only if
+// the model actually emits the transfer entries).
+const REGION_TRANSFER_CONTRACT =
+  "Territory changes on the map ONLY through impacts.regionTransfers — narration alone never moves a border. " +
+  "Emit one entry for EVERY region that changes hands: " +
+  '{"regionId":"<exact map region id if known, else empty>","regionName":"<the region\'s name>","fromCode":"<current owner code>","toCode":"<new owner code>"}. ' +
+  "Region names are resolved to map regions automatically, so an exact name is enough; " +
+  "to transfer a polity's entire territory, put the polity or country name in regionName.";
+
 export const simulateTimelineJump = async ({ days, mode = "jump" } = {}) => {
   const bundle = await readGameStateBundle({ force: true });
   const baseColors = await readJson(JSON_URLS.colors, { defaultValue: {}, force: true });
@@ -1538,13 +1589,14 @@ export const simulateTimelineJump = async ({ days, mode = "jump" } = {}) => {
     // of silently swapping in the canned fallback after a few seconds.
     timeoutMs: 180000,
     userMessage:
-      mode === "auto"
+      (mode === "auto"
         ? "Simulate an auto-jump and stop at the next notable or player-relevant event. Return JSON only. " +
           "Scale the events array to the time actually covered before your stop point: roughly 1-2 events per week, " +
           "5-7 per month, 10-13 per quarter, up to 29-37 for a full year — spread their dates across the covered period."
         : `Simulate a standard jump forward to the requested target date. Return JSON only. The "events" array must ` +
           `contain between ${minEvents} and ${maxEvents} events (this jump covers ${safeDays} days), with their dates ` +
-          `spread across the skipped period.`,
+          `spread across the skipped period.`) +
+      ` ${REGION_TRANSFER_CONTRACT}`,
     variables,
   });
 
@@ -1597,7 +1649,7 @@ export const applyGameMasterCommand = async (requestText) => {
       },
       summary: "No deterministic GM fallback changes were inferred from the request.",
     }),
-    userMessage: "Apply the GM request as JSON only.",
+    userMessage: `Apply the GM request as JSON only. ${REGION_TRANSFER_CONTRACT}`,
     variables,
   });
 

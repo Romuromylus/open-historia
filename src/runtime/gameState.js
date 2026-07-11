@@ -377,10 +377,15 @@ const normalizeRegionTransfer = (entry) => {
   }
 
   const regionId = normalizeOptionalString(entry.regionId || entry.id || entry.gid || entry.GID_1);
+  const regionName = normalizeOptionalString(entry.regionName || entry.name);
   const toCode = normalizeOptionalString(entry.toCode || entry.toPolity || entry.ownerCode || entry.owner);
   const fromCode = normalizeOptionalString(entry.fromCode || entry.fromPolity);
 
-  if (!regionId || !toCode) {
+  // A name-only transfer is kept: the AI usually knows regions by NAME, not map
+  // id, and the simulation resolves names to real region ids before applying
+  // (see runtime/regionTransferResolver.js). Only a transfer with no target at
+  // all, or nothing identifying the territory, is dropped.
+  if ((!regionId && !regionName) || !toCode) {
     return null;
   }
 
@@ -388,7 +393,7 @@ const normalizeRegionTransfer = (entry) => {
     fromCode,
     note: normalizeOptionalString(entry.note || entry.reason),
     regionId,
-    regionName: normalizeOptionalString(entry.regionName || entry.name),
+    regionName,
     toCode,
   };
 };
@@ -801,6 +806,9 @@ export const applyEventImpactsToWorld = ({ colors = {}, events = [], world }) =>
 
   for (const event of normalizeEvents(events)) {
     for (const transfer of event.impacts.regionTransfers) {
+      // Name-only transfers (no resolved region id) never become overrides — an
+      // empty/unresolved key would silently color nothing on the map.
+      if (!transfer.regionId) continue;
       nextWorld.regionOwnershipOverrides[transfer.regionId] = transfer.toCode;
     }
 

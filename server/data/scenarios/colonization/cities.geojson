@@ -1,0 +1,133 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          12.48,
+          41.9
+        ]
+      },
+      "properties": {
+        "city": "Aurel",
+        "population": 20000,
+        "capital": "primary",
+        "tier": 4
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          23.73,
+          37.98
+        ]
+      },
+      "properties": {
+        "city": "Thalos",
+        "population": 20000,
+        "capital": "primary",
+        "tier": 4
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          31.24,
+          30.05
+        ]
+      },
+      "properties": {
+        "city": "Nyra",
+        "population": 20000,
+        "capital": "primary",
+        "tier": 4
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          44.36,
+          33.31
+        ]
+      },
+      "properties": {
+        "city": "Ereth",
+        "population": 20000,
+        "capital": "primary",
+        "tier": 4
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          80.95,
+          26.85
+        ]
+      },
+      "properties": {
+        "city": "Suryapur",
+        "population": 20000,
+        "capital": "primary",
+        "tier": 4
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          108.94,
+          34.34
+        ]
+      },
+      "properties": {
+        "city": "Tianxu",
+        "population": 20000,
+        "capital": "primary",
+        "tier": 4
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          3.9,
+          7.85
+        ]
+      },
+      "properties": {
+        "city": "Ashka",
+        "population": 20000,
+        "capital": "primary",
+        "tier": 4
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          -71.97,
+          -13.53
+        ]
+      },
+      "properties": {
+        "city": "Q'entar",
+        "population": 20000,
+        "capital": "primary",
+        "tier": 4
+      }
+    }
+  ]
+}

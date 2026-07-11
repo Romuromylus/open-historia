@@ -28,3 +28,6 @@ server/data/*
 *.njsproj
 *.sln
 *.sw?
+
+# Local Claude Code tooling (not for the public fork)
+.claude/

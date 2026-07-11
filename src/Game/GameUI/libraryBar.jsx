@@ -40,6 +40,7 @@ const UNIT_TYPE_LABELS = {
   naval: "Naval",
   artillery: "Artillery",
   garrison: "Garrison",
+  settler: "Settler",
 };
 
 // Lazy so OpenLayers only loads when the in-game map editor is opened.

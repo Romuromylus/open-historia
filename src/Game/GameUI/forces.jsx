@@ -19,6 +19,7 @@ const TYPE_LABEL = {
   naval: "Naval",
   artillery: "Artillery",
   garrison: "Garrison",
+  settler: "Settler",
 };
 const TYPE_GLYPH = {
   infantry: "🛡",
@@ -27,6 +28,7 @@ const TYPE_GLYPH = {
   naval: "⚓",
   artillery: "💥",
   garrison: "🏰",
+  settler: "🛖",
 };
 
 const MODE_HINT = {

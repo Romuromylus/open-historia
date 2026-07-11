@@ -71,6 +71,8 @@ export const JSON_URLS = {
   regionsGeojson: "",
   citiesGeojson: "",
   backgroundData: "",
+  adjacency: "",
+  centroids: "",
   world: "",
 };
 
@@ -179,6 +181,8 @@ export const setRuntimeAssetEndpoints = ({ token = "" } = {}) => {
   JSON_URLS.regionsGeojson = withRuntimeToken("/api/runtime/json/regionsGeojson");
   JSON_URLS.citiesGeojson = withRuntimeToken("/api/runtime/json/citiesGeojson");
   JSON_URLS.backgroundData = withRuntimeToken("/api/runtime/json/backgroundData");
+  JSON_URLS.adjacency = withRuntimeToken("/api/runtime/json/adjacency");
+  JSON_URLS.centroids = withRuntimeToken("/api/runtime/json/centroids");
   JSON_URLS.world = withRuntimeToken("/api/runtime/json/world");
 
   PMTILES_ARCHIVES.cities = buildAbsoluteUrl("/api/runtime/pmtiles/cities");

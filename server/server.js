@@ -52,11 +52,25 @@ import {
   isAllowedHubUrl,
   parseByteRange,
 } from "./security.js";
+import {
+  applyManagedRelay,
+  publicManagedAiConfig,
+  readManagedAiConfig,
+} from "./managedAi.js";
 
 const __dirname = path.dirname(url.fileURLToPath(import.meta.url));
 const app = express();
 const PORT = process.env.PORT || 3000;
 const distDir = path.join(__dirname, "../dist");
+
+// Optional server-baked LLM endpoint (see managedAi.js). When LLM_BASE_URL +
+// LLM_API_KEY are set, every browser uses that endpoint with no Settings entry
+// and the key never leaves the server. Read once at boot — env doesn't change
+// under a running process.
+const managedAiConfig = readManagedAiConfig();
+if (managedAiConfig.enabled) {
+  console.log(`[ai] Managed LLM endpoint active (model: ${managedAiConfig.model || "auto-detect"}).`);
+}
 
 const jsonParser = express.json({ limit: "64mb" });
 const largeJsonParser = express.json({ limit: "2048mb" });
@@ -505,14 +519,18 @@ const HUB_MAX_BUNDLE_BYTES = 200 * 1024 * 1024;
 app.post("/api/ai/relay", largeJsonParser, async (req, res) => {
   try {
     const { url: targetUrl, method = "POST", headers = {}, payload } = req.body ?? {};
-    const target = new URL(String(targetUrl ?? ""));
+    // Managed mode rewrites a sentinel-host request to the operator's real endpoint
+    // and injects the API key here — the browser never sees either. A no-op for
+    // stock installs and for any request not aimed at the sentinel.
+    const relayed = applyManagedRelay({ url: targetUrl, headers, payload, method }, managedAiConfig);
+    const target = new URL(String(relayed.url ?? ""));
     if (target.protocol !== "http:" && target.protocol !== "https:") {
       return sendError(res, 400, new Error("Only http(s) AI endpoints can be relayed."));
     }
     const upstream = await fetch(target, {
       method: method === "GET" ? "GET" : "POST",
-      headers: { "Content-Type": "application/json", ...headers },
-      body: method === "GET" ? undefined : JSON.stringify(payload ?? {}),
+      headers: { "Content-Type": "application/json", ...relayed.headers },
+      body: method === "GET" ? undefined : JSON.stringify(relayed.payload ?? {}),
     });
     const text = await upstream.text();
     res.status(upstream.status);
@@ -521,6 +539,15 @@ app.post("/api/ai/relay", largeJsonParser, async (req, res) => {
   } catch (error) {
     sendError(res, 502, error);
   }
+});
+
+// Tells the client whether a server-baked LLM endpoint exists (and which model),
+// so it can auto-configure without a per-browser Settings entry. Never exposes the
+// endpoint URL or API key. Stock installs report { managed: false } and the client
+// leaves provider settings to the player.
+app.get("/api/ai/config", (_req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  res.json(publicManagedAiConfig(managedAiConfig));
 });
 
 // Shut the server down from the UI (the ⏻ button in the top bar) — handy on

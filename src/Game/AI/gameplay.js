@@ -35,6 +35,8 @@ import {
   writeWorldState,
 } from "../../runtime/gameState.js";
 import { difficultyDirective } from "../../runtime/difficulty.js";
+import { resolveExpansion } from "../../runtime/expansion.js";
+import { planAiTurn } from "../../runtime/aiTurn.js";
 
 const CHAT_HINT_PATTERNS = [
   /\bchat\b/i,
@@ -465,6 +467,7 @@ const buildTemplateVariables = async (
     catalystOpening = "",
     catalystPremise = "",
     chat = null,
+    deterministicTerritoryChanges = "",
     eventsToConsolidate = "",
     gameMasterRequest = "",
     targetDate = "",
@@ -503,6 +506,12 @@ const buildTemplateVariables = async (
     chatsToConsolidate: buildChatSummaryText(bundle.chats, { limit: 12 }),
     date,
     dateReadable: formatDateReadable(date),
+    // Territory the deterministic expansion engine settled/conquered this turn (see
+    // simulateTimelineJump). Always present so any prompt may reference it; the jump
+    // prompt narrates these as already-final so the story matches the map.
+    deterministicTerritoryChanges:
+      normalizeString(deterministicTerritoryChanges) ||
+      "No territory changed hands through settlement or conquest this turn.",
     difficulty: bundle.game.difficulty || "standard",
     difficultyGuidanceChats: buildDifficultyGuidance(bundle.game.difficulty, "chats"),
     difficultyGuidanceJumpForward: buildDifficultyGuidance(bundle.game.difficulty, "jump"),
@@ -1450,9 +1459,67 @@ const eventCountRangeForDays = (days) => {
   return [29, 37];
 };
 
+// Pax Colonia's deterministic expansion turn. Runs BEFORE the LLM narrates so the story
+// can match the map: the AI powers issue orders (planAiTurn), the resolver finalizes every
+// settlement and conquest (resolveExpansion), and the results are folded into `bundle.world`
+// (regionOwnershipOverrides + units). Returns a human-readable summary of what changed for the
+// jump prompt. A no-op — returns "" and touches nothing — for scenarios that ship no adjacency
+// graph (i.e. every stock Open Historia scenario), so this is purely additive to the base game.
+const applyDeterministicExpansion = async (bundle) => {
+  const adjacency = await readJson(JSON_URLS.adjacency, { defaultValue: {} }).catch(() => ({}));
+  // The scenario-geojson fallback serves an empty FeatureCollection when a scenario has no
+  // adjacency file; a real graph is a plain { regionId: [...] } map. Gate on that shape.
+  const hasAdjacency = adjacency && typeof adjacency === "object" && !adjacency.features && Object.keys(adjacency).length > 0;
+  if (!hasAdjacency) return "";
+
+  const centroids = await readJson(JSON_URLS.centroids, { defaultValue: {} }).catch(() => ({}));
+  const ownership = { ...(bundle.world.regionOwnershipOverrides || {}) };
+  const behaviors = bundle.world.behaviors || {};
+  const playerCode = bundle.game.country || "";
+  const round = bundle.game.round || 1;
+
+  // Player-deployed units carry lng/lat but no regionId (see unitsController.deployUnit), so
+  // give the resolver a nearest-centroid lookup to place them. AI units already carry an exact
+  // regionId and skip this (resolver uses regionId first). Nearest-centroid is approximate but
+  // cheap and dependency-free — good enough to route a settler the player placed on a region.
+  const centroidEntries = Object.entries(centroids);
+  const regionAt = (lng, lat) => {
+    if (!Number.isFinite(lng) || !Number.isFinite(lat) || centroidEntries.length === 0) return null;
+    let best = null;
+    let bestD = Infinity;
+    for (const [rid, [clng, clat]] of centroidEntries) {
+      const d = (clng - lng) ** 2 + (clat - lat) ** 2;
+      if (d < bestD) { bestD = d; best = rid; }
+    }
+    return best;
+  };
+
+  // 1. Each AI power moves its settlers/armies and raises new forces per its temperament.
+  const planned = planAiTurn({ ownership, units: bundle.world.units || [], adjacency, centroids, behaviors, playerCode, round });
+
+  // 2. The engine finalizes territory: settlements founded, undefended land conquered.
+  const resolved = resolveExpansion({ ownership, units: planned.units, adjacency, regionAt });
+
+  // 3. Fold the authoritative result back into the world the LLM will narrate and we will persist.
+  bundle.world.regionOwnershipOverrides = resolved.ownership;
+  bundle.world.units = resolved.units;
+
+  if (resolved.ownershipChanges.length === 0) return "";
+
+  const nameOf = (code) => bundle.world.polityOverrides?.[code]?.name || code;
+  const lines = resolved.ownershipChanges.map((c) =>
+    c.kind === "conquest"
+      ? `${nameOf(c.to)} conquered the region ${c.regionId} from ${nameOf(c.from)}.`
+      : `${nameOf(c.to)} founded a new colony in the region ${c.regionId}.`,
+  );
+  return `This turn, ${resolved.ownershipChanges.length} territory change(s) occurred and are FINAL. ${lines.join(" ")}`;
+};
+
 export const simulateTimelineJump = async ({ days, mode = "jump" } = {}) => {
   const bundle = await readGameStateBundle({ force: true });
   const baseColors = await readJson(JSON_URLS.colors, { defaultValue: {}, force: true });
+  // Resolve deterministic settlement/conquest first, then let the LLM narrate what already happened.
+  const territorySummary = await applyDeterministicExpansion(bundle);
   const safeDays = Math.max(1, Math.trunc(Number(days) || 0));
   // Ancient/FMG scenarios use plain-text or BCE dates dayjs can't parse. Guard
   // the day-math so it doesn't format to the literal string "Invalid Date" and
@@ -1463,7 +1530,7 @@ export const simulateTimelineJump = async ({ days, mode = "jump" } = {}) => {
   const targetDate = parsedGameDate.isValid()
     ? parsedGameDate.add(safeDays, "day").format("YYYY-MM-DD")
     : normalizeString(bundle.game.gameDate);
-  const variables = await buildTemplateVariables(bundle, { targetDate });
+  const variables = await buildTemplateVariables(bundle, { targetDate, deterministicTerritoryChanges: territorySummary });
   const [minEvents, maxEvents] = eventCountRangeForDays(safeDays);
   let payload = await runJsonTask(mode === "auto" ? "autoJumpForward" : "jumpForward", {
     fallback: () => fallbackJumpSimulation({ bundle, days: safeDays, mode, targetDate }),

@@ -8,7 +8,7 @@
     "build": "vite build",
     "lint": "eslint .",
     "preview": "vite preview",
-    "test": "node --test \"server/**/*.test.js\""
+    "test": "node --test \"server/**/*.test.js\" \"src/**/*.test.js\""
   },
   "dependencies": {
     "@turf/area": "^7.3.5",

@@ -1,0 +1,29 @@
+# Rebuilt inside the image — never copy the host's versions.
+node_modules
+dist
+dist-ssr
+
+# Runtime state (persisted in a volume, not baked into the image). Scenarios are
+# NOT ignored — they are the baked seed content the game ships with.
+server/data/games
+server/data/basemaps
+server/data/mapeditor-documents
+server/data/.trash
+server/data/hub-cache
+server/data/import-pings
+server/data/*-manifest.json
+
+# Vendored at runtime, not needed in the image.
+fmg
+
+# Logs, editor, OS cruft.
+*.log
+logs
+.vscode
+.idea
+.DS_Store
+*.local
+
+# NOTE: .git is intentionally NOT ignored — the build stage needs it for
+# `git lfs pull`. It is only present in the build stage; the runtime stage
+# copies dist/, server/, and public/ but never .git.

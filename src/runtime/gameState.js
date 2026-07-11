@@ -29,7 +29,10 @@ export const WORLD_DEFAULTS = {
 
 // Military units that ride along inside world state (world.units[]). Stored here
 // so they share every existing read/write/poll/normalize path with no server change.
-export const UNIT_TYPES = ["infantry", "armor", "air", "naval", "artillery", "garrison"];
+// "settler" is a non-combat colonist consumed to found a settlement on an adjacent
+// neutral region (see src/runtime/expansion.js). Kept last so military-type ordering
+// is unchanged for existing scenarios.
+export const UNIT_TYPES = ["infantry", "armor", "air", "naval", "artillery", "garrison", "settler"];
 const UNIT_TYPE_SET = new Set(UNIT_TYPES);
 // "pending" = a player deployment awaiting AI resolution (rendered translucent).
 const UNIT_STATUS_SET = new Set(["idle", "moving", "engaged", "defeated", "pending"]);

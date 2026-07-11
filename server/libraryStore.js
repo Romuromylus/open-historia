@@ -201,6 +201,12 @@ const SCENARIO_GEOJSON_ASSET_FILES = {
   // heavy payload ({ dataUrl } for images, { geojson } for vector) so world.json
   // stays light for the 5s poll. Loaded once by the game when world.background is set.
   backgroundData: "background.json",
+  // Pax Colonia deterministic-expansion data, precomputed from regions.geojson by
+  // scripts/presets/build-adjacency.mjs: the land-adjacency graph and a representative
+  // point per region. Scenario-scoped static data (like the geojson), read once by the
+  // turn loop. Scenarios without these fall back to the empty default (no expansion).
+  adjacency: "adjacency.json",
+  centroids: "centroids.json",
 };
 
 const EMPTY_FEATURE_COLLECTION = { type: "FeatureCollection", features: [] };

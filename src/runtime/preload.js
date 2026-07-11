@@ -12,6 +12,7 @@ import {
   warmRemoteResources,
 } from "./assets.js";
 import { warmCountryLabelCollections } from "./countryLabels.js";
+import { applyManagedAiConfig } from "./managedAi.js";
 
 export const STARTUP_TIME_BUDGET_MS = 30_000;
 const INITIAL_VIEWPORT = {
@@ -216,6 +217,11 @@ export const runStartupPreload = async ({
   };
 
   publish("Preparing the world");
+
+  // Adopt a server-baked LLM endpoint before anything else, so the first AI call
+  // of the session is already pointed at it. Non-blocking on failure (no-op for
+  // stock installs) and cheap — one tiny same-origin request.
+  await applyManagedAiConfig().catch(() => {});
 
   for (const task of STARTUP_TASKS) {
     const elapsedMs = performance.now() - startedAt;

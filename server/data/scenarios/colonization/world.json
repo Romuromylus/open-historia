@@ -1,0 +1,512 @@
+{
+  "regionOwnershipOverrides": {
+    "ITA.8_1": "AURELIA",
+    "GRC.3_1": "THALASSA",
+    "EGY.11_1": "NYROS",
+    "IRQ.10_1": "ERETHIA",
+    "IND.34_1": "SURYAVA",
+    "CHN.22_1": "TIANXU",
+    "NGA.31_1": "ASHKANI",
+    "PER.8_1": "QENTAR"
+  },
+  "polityOverrides": {
+    "AURELIA": {
+      "code": "AURELIA",
+      "name": "Aurelian Hegemony",
+      "aliases": [
+        "Aurelia",
+        "the Hegemony"
+      ],
+      "color": "#c0392b",
+      "note": "Disciplined legions and road-builders of the western peninsula; expand by planting fortified colonies."
+    },
+    "THALASSA": {
+      "code": "THALASSA",
+      "name": "Thalassine League",
+      "aliases": [
+        "Thalassa",
+        "the League"
+      ],
+      "color": "#2980b9",
+      "note": "Seafaring traders and colonists of the inner sea; spread along coasts and islands."
+    },
+    "NYROS": {
+      "code": "NYROS",
+      "name": "Nyros Dominion",
+      "aliases": [
+        "Nyros",
+        "the Dominion"
+      ],
+      "color": "#f1c40f",
+      "note": "River-valley priest-kings whose granaries feed vast levies; expand up and down the great river."
+    },
+    "ERETHIA": {
+      "code": "ERETHIA",
+      "name": "Erethian Empire",
+      "aliases": [
+        "Erethia",
+        "the Twin Rivers"
+      ],
+      "color": "#8e44ad",
+      "note": "Ancient city-builders and astronomers of the twin rivers; expand by canal, wall and conquest."
+    },
+    "SURYAVA": {
+      "code": "SURYAVA",
+      "name": "Suryavani Realm",
+      "aliases": [
+        "Suryava",
+        "the Sun Realm"
+      ],
+      "color": "#e67e22",
+      "note": "Sun-worshipping dynasts of the great plain; expand along the sacred rivers."
+    },
+    "TIANXU": {
+      "code": "TIANXU",
+      "name": "Tianxu Mandate",
+      "aliases": [
+        "Tianxu",
+        "the Mandate"
+      ],
+      "color": "#27ae60",
+      "note": "Heaven-mandated bureaucrats of the loess plateau; expand by wall, canal and settled farmland."
+    },
+    "ASHKANI": {
+      "code": "ASHKANI",
+      "name": "Ashkani Confederation",
+      "aliases": [
+        "Ashkani",
+        "the Confederation"
+      ],
+      "color": "#16a085",
+      "note": "Ironworking savannah horse-lords; expand across grasslands with cavalry and gold."
+    },
+    "QENTAR": {
+      "code": "QENTAR",
+      "name": "Q'entar Ascendancy",
+      "aliases": [
+        "Qentar",
+        "the Ascendancy"
+      ],
+      "color": "#e84393",
+      "note": "Highland terrace-builders of the great mountains; expand along the peaks and valleys."
+    }
+  },
+  "customRegions": true,
+  "customCities": true,
+  "allowedUnitTypes": [
+    "infantry",
+    "armor",
+    "artillery",
+    "naval",
+    "garrison",
+    "settler"
+  ],
+  "simulationRules": "This is c. 500 BCE. Eight fledgling powers each begin holding a SINGLE city-region in a vast, mostly UNCLAIMED world. Powers grow chiefly by sending colonists and armies into neighbouring unclaimed land, and less often by warring with rivals they eventually reach. Keep everything ANCIENT: bronze and iron arms, infantry, cavalry and chariots, war galleys, city walls and siege works — no gunpowder and no modern technology. Armies are small (hundreds to a few thousand) and logistics are slow, so expansion is gradual and region-by-region, not sweeping. Early on the powers are far apart, so most turns are about local growth into empty land rather than direct war between powers. Each power has its own temperament: the Aurelian Hegemony advances in disciplined steps, fortifying each new colony before reaching for the next; the Thalassine League prefers trade and settlement to war, seeding colonies wide along coasts and islands; the Nyros Dominion grows deliberately but fields large levies, defending its river heartland fiercely; the Erethian Empire the aggressor of the age, quick to march on any neighbour it can reach; the Suryavani Realm a steady, balanced power that settles and wars in equal measure; the Tianxu Mandate walls its borders and consolidates farmland, rarely striking first; the Ashkani Confederation fast and fearless, raiding and claiming open grassland with cavalry; the Q'entar Ascendancy keeps to the high mountains, expanding slowly and shunning open war. Let these temperaments drive who settles peacefully and who marches on its neighbours.",
+  "startingTimelineText": "In an age when most of the world is wilderness, eight cities light the first fires of empire: the Aurelian Hegemony on its western peninsula, the seafaring Thalassine League, the river priest-kings of Nyros, the Erethian city-builders of the twin rivers, the Suryavani of the great plain, the Tianxu of the loess plateau, the Ashkani horse-lords of the savannah, and the Q'entar of the high mountains. Each holds a single city and the land it can see. Beyond lies an empty world, waiting to be claimed.",
+  "ownerCodes": [
+    "ASHKANI",
+    "AURELIA",
+    "ERETHIA",
+    "NYROS",
+    "QENTAR",
+    "SURYAVA",
+    "THALASSA",
+    "TIANXU"
+  ],
+  "units": [
+    {
+      "id": "start-AURELIA-garrison",
+      "name": "Aurel Garrison",
+      "type": "garrison",
+      "ownerCode": "AURELIA",
+      "strength": 120,
+      "lng": 12.48,
+      "lat": 41.9,
+      "regionId": "ITA.8_1",
+      "status": "idle",
+      "source": "scenario",
+      "createdAt": "2026-07-11T08:13:14.467Z",
+      "updatedAt": "2026-07-11T08:13:14.467Z"
+    },
+    {
+      "id": "start-AURELIA-host",
+      "name": "Aurelian Hegemony Host",
+      "type": "infantry",
+      "ownerCode": "AURELIA",
+      "strength": 100,
+      "lng": 12.63,
+      "lat": 42.05,
+      "regionId": "ITA.8_1",
+      "status": "idle",
+      "source": "scenario",
+      "createdAt": "2026-07-11T08:13:14.467Z",
+      "updatedAt": "2026-07-11T08:13:14.467Z"
+    },
+    {
+      "id": "start-AURELIA-settler",
+      "name": "Aurelian Hegemony Settlers",
+      "type": "settler",
+      "ownerCode": "AURELIA",
+      "strength": 10,
+      "lng": 12.33,
+      "lat": 41.75,
+      "regionId": "ITA.8_1",
+      "status": "idle",
+      "source": "scenario",
+      "createdAt": "2026-07-11T08:13:14.467Z",
+      "updatedAt": "2026-07-11T08:13:14.467Z"
+    },
+    {
+      "id": "start-THALASSA-garrison",
+      "name": "Thalos Garrison",
+      "type": "garrison",
+      "ownerCode": "THALASSA",
+      "strength": 120,
+      "lng": 23.73,
+      "lat": 37.98,
+      "regionId": "GRC.3_1",
+      "status": "idle",
+      "source": "scenario",
+      "createdAt": "2026-07-11T08:13:14.467Z",
+      "updatedAt": "2026-07-11T08:13:14.467Z"
+    },
+    {
+      "id": "start-THALASSA-host",
+      "name": "Thalassine League Host",
+      "type": "infantry",
+      "ownerCode": "THALASSA",
+      "strength": 100,
+      "lng": 23.88,
+      "lat": 38.129999999999995,
+      "regionId": "GRC.3_1",
+      "status": "idle",
+      "source": "scenario",
+      "createdAt": "2026-07-11T08:13:14.467Z",
+      "updatedAt": "2026-07-11T08:13:14.467Z"
+    },
+    {
+      "id": "start-THALASSA-settler",
+      "name": "Thalassine League Settlers",
+      "type": "settler",
+      "ownerCode": "THALASSA",
+      "strength": 10,
+      "lng": 23.580000000000002,
+      "lat": 37.83,
+      "regionId": "GRC.3_1",
+      "status": "idle",
+      "source": "scenario",
+      "createdAt": "2026-07-11T08:13:14.467Z",
+      "updatedAt": "2026-07-11T08:13:14.467Z"
+    },
+    {
+      "id": "start-NYROS-garrison",
+      "name": "Nyra Garrison",
+      "type": "garrison",
+      "ownerCode": "NYROS",
+      "strength": 120,
+      "lng": 31.24,
+      "lat": 30.05,
+      "regionId": "EGY.11_1",
+      "status": "idle",
+      "source": "scenario",
+      "createdAt": "2026-07-11T08:13:14.467Z",
+      "updatedAt": "2026-07-11T08:13:14.467Z"
+    },
+    {
+      "id": "start-NYROS-host",
+      "name": "Nyros Dominion Host",
+      "type": "infantry",
+      "ownerCode": "NYROS",
+      "strength": 100,
+      "lng": 31.389999999999997,
+      "lat": 30.2,
+      "regionId": "EGY.11_1",
+      "status": "idle",
+      "source": "scenario",
+      "createdAt": "2026-07-11T08:13:14.467Z",
+      "updatedAt": "2026-07-11T08:13:14.467Z"
+    },
+    {
+      "id": "start-NYROS-settler",
+      "name": "Nyros Dominion Settlers",
+      "type": "settler",
+      "ownerCode": "NYROS",
+      "strength": 10,
+      "lng": 31.09,
+      "lat": 29.900000000000002,
+      "regionId": "EGY.11_1",
+      "status": "idle",
+      "source": "scenario",
+      "createdAt": "2026-07-11T08:13:14.467Z",
+      "updatedAt": "2026-07-11T08:13:14.467Z"
+    },
+    {
+      "id": "start-ERETHIA-garrison",
+      "name": "Ereth Garrison",
+      "type": "garrison",
+      "ownerCode": "ERETHIA",
+      "strength": 120,
+      "lng": 44.36,
+      "lat": 33.31,
+      "regionId": "IRQ.10_1",
+      "status": "idle",
+      "source": "scenario",
+      "createdAt": "2026-07-11T08:13:14.467Z",
+      "updatedAt": "2026-07-11T08:13:14.467Z"
+    },
+    {
+      "id": "start-ERETHIA-host",
+      "name": "Erethian Empire Host",
+      "type": "infantry",
+      "ownerCode": "ERETHIA",
+      "strength": 100,
+      "lng": 44.51,
+      "lat": 33.46,
+      "regionId": "IRQ.10_1",
+      "status": "idle",
+      "source": "scenario",
+      "createdAt": "2026-07-11T08:13:14.467Z",
+      "updatedAt": "2026-07-11T08:13:14.467Z"
+    },
+    {
+      "id": "start-ERETHIA-settler",
+      "name": "Erethian Empire Settlers",
+      "type": "settler",
+      "ownerCode": "ERETHIA",
+      "strength": 10,
+      "lng": 44.21,
+      "lat": 33.160000000000004,
+      "regionId": "IRQ.10_1",
+      "status": "idle",
+      "source": "scenario",
+      "createdAt": "2026-07-11T08:13:14.467Z",
+      "updatedAt": "2026-07-11T08:13:14.467Z"
+    },
+    {
+      "id": "start-SURYAVA-garrison",
+      "name": "Suryapur Garrison",
+      "type": "garrison",
+      "ownerCode": "SURYAVA",
+      "strength": 120,
+      "lng": 80.95,
+      "lat": 26.85,
+      "regionId": "IND.34_1",
+      "status": "idle",
+      "source": "scenario",
+      "createdAt": "2026-07-11T08:13:14.467Z",
+      "updatedAt": "2026-07-11T08:13:14.467Z"
+    },
+    {
+      "id": "start-SURYAVA-host",
+      "name": "Suryavani Realm Host",
+      "type": "infantry",
+      "ownerCode": "SURYAVA",
+      "strength": 100,
+      "lng": 81.10000000000001,
+      "lat": 27,
+      "regionId": "IND.34_1",
+      "status": "idle",
+      "source": "scenario",
+      "createdAt": "2026-07-11T08:13:14.467Z",
+      "updatedAt": "2026-07-11T08:13:14.467Z"
+    },
+    {
+      "id": "start-SURYAVA-settler",
+      "name": "Suryavani Realm Settlers",
+      "type": "settler",
+      "ownerCode": "SURYAVA",
+      "strength": 10,
+      "lng": 80.8,
+      "lat": 26.700000000000003,
+      "regionId": "IND.34_1",
+      "status": "idle",
+      "source": "scenario",
+      "createdAt": "2026-07-11T08:13:14.467Z",
+      "updatedAt": "2026-07-11T08:13:14.467Z"
+    },
+    {
+      "id": "start-TIANXU-garrison",
+      "name": "Tianxu Garrison",
+      "type": "garrison",
+      "ownerCode": "TIANXU",
+      "strength": 120,
+      "lng": 108.94,
+      "lat": 34.34,
+      "regionId": "CHN.22_1",
+      "status": "idle",
+      "source": "scenario",
+      "createdAt": "2026-07-11T08:13:14.467Z",
+      "updatedAt": "2026-07-11T08:13:14.467Z"
+    },
+    {
+      "id": "start-TIANXU-host",
+      "name": "Tianxu Mandate Host",
+      "type": "infantry",
+      "ownerCode": "TIANXU",
+      "strength": 100,
+      "lng": 109.09,
+      "lat": 34.49,
+      "regionId": "CHN.22_1",
+      "status": "idle",
+      "source": "scenario",
+      "createdAt": "2026-07-11T08:13:14.467Z",
+      "updatedAt": "2026-07-11T08:13:14.467Z"
+    },
+    {
+      "id": "start-TIANXU-settler",
+      "name": "Tianxu Mandate Settlers",
+      "type": "settler",
+      "ownerCode": "TIANXU",
+      "strength": 10,
+      "lng": 108.78999999999999,
+      "lat": 34.190000000000005,
+      "regionId": "CHN.22_1",
+      "status": "idle",
+      "source": "scenario",
+      "createdAt": "2026-07-11T08:13:14.467Z",
+      "updatedAt": "2026-07-11T08:13:14.467Z"
+    },
+    {
+      "id": "start-ASHKANI-garrison",
+      "name": "Ashka Garrison",
+      "type": "garrison",
+      "ownerCode": "ASHKANI",
+      "strength": 120,
+      "lng": 3.9,
+      "lat": 7.85,
+      "regionId": "NGA.31_1",
+      "status": "idle",
+      "source": "scenario",
+      "createdAt": "2026-07-11T08:13:14.467Z",
+      "updatedAt": "2026-07-11T08:13:14.467Z"
+    },
+    {
+      "id": "start-ASHKANI-host",
+      "name": "Ashkani Confederation Host",
+      "type": "infantry",
+      "ownerCode": "ASHKANI",
+      "strength": 100,
+      "lng": 4.05,
+      "lat": 8,
+      "regionId": "NGA.31_1",
+      "status": "idle",
+      "source": "scenario",
+      "createdAt": "2026-07-11T08:13:14.467Z",
+      "updatedAt": "2026-07-11T08:13:14.467Z"
+    },
+    {
+      "id": "start-ASHKANI-settler",
+      "name": "Ashkani Confederation Settlers",
+      "type": "settler",
+      "ownerCode": "ASHKANI",
+      "strength": 10,
+      "lng": 3.75,
+      "lat": 7.699999999999999,
+      "regionId": "NGA.31_1",
+      "status": "idle",
+      "source": "scenario",
+      "createdAt": "2026-07-11T08:13:14.467Z",
+      "updatedAt": "2026-07-11T08:13:14.467Z"
+    },
+    {
+      "id": "start-QENTAR-garrison",
+      "name": "Q'entar Garrison",
+      "type": "garrison",
+      "ownerCode": "QENTAR",
+      "strength": 120,
+      "lng": -71.97,
+      "lat": -13.53,
+      "regionId": "PER.8_1",
+      "status": "idle",
+      "source": "scenario",
+      "createdAt": "2026-07-11T08:13:14.467Z",
+      "updatedAt": "2026-07-11T08:13:14.467Z"
+    },
+    {
+      "id": "start-QENTAR-host",
+      "name": "Q'entar Ascendancy Host",
+      "type": "infantry",
+      "ownerCode": "QENTAR",
+      "strength": 100,
+      "lng": -71.82,
+      "lat": -13.379999999999999,
+      "regionId": "PER.8_1",
+      "status": "idle",
+      "source": "scenario",
+      "createdAt": "2026-07-11T08:13:14.467Z",
+      "updatedAt": "2026-07-11T08:13:14.467Z"
+    },
+    {
+      "id": "start-QENTAR-settler",
+      "name": "Q'entar Ascendancy Settlers",
+      "type": "settler",
+      "ownerCode": "QENTAR",
+      "strength": 10,
+      "lng": -72.12,
+      "lat": -13.68,
+      "regionId": "PER.8_1",
+      "status": "idle",
+      "source": "scenario",
+      "createdAt": "2026-07-11T08:13:14.467Z",
+      "updatedAt": "2026-07-11T08:13:14.467Z"
+    }
+  ],
+  "behaviors": {
+    "AURELIA": {
+      "archetype": "Methodical Expansionist",
+      "aggression": 0.55,
+      "expansion": 0.75,
+      "caution": 0.55,
+      "blurb": "advances in disciplined steps, fortifying each new colony before reaching for the next"
+    },
+    "THALASSA": {
+      "archetype": "Peaceful Colonizer",
+      "aggression": 0.25,
+      "expansion": 0.9,
+      "caution": 0.35,
+      "blurb": "prefers trade and settlement to war, seeding colonies wide along coasts and islands"
+    },
+    "NYROS": {
+      "archetype": "Entrenched Powerhouse",
+      "aggression": 0.45,
+      "expansion": 0.6,
+      "caution": 0.75,
+      "blurb": "grows deliberately but fields large levies, defending its river heartland fiercely"
+    },
+    "ERETHIA": {
+      "archetype": "Warlike Conqueror",
+      "aggression": 0.9,
+      "expansion": 0.5,
+      "caution": 0.3,
+      "blurb": "the aggressor of the age, quick to march on any neighbour it can reach"
+    },
+    "SURYAVA": {
+      "archetype": "Balanced Dynasty",
+      "aggression": 0.5,
+      "expansion": 0.65,
+      "caution": 0.5,
+      "blurb": "a steady, balanced power that settles and wars in equal measure"
+    },
+    "TIANXU": {
+      "archetype": "Cautious Consolidator",
+      "aggression": 0.35,
+      "expansion": 0.7,
+      "caution": 0.85,
+      "blurb": "walls its borders and consolidates farmland, rarely striking first"
+    },
+    "ASHKANI": {
+      "archetype": "Mobile Raider",
+      "aggression": 0.8,
+      "expansion": 0.7,
+      "caution": 0.2,
+      "blurb": "fast and fearless, raiding and claiming open grassland with cavalry"
+    },
+    "QENTAR": {
+      "archetype": "Reclusive Highlander",
+      "aggression": 0.3,
+      "expansion": 0.5,
+      "caution": 0.85,
+      "blurb": "keeps to the high mountains, expanding slowly and shunning open war"
+    }
+  }
+}

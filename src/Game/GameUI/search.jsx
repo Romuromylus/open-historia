@@ -277,8 +277,8 @@ const Search = memo(({ mapRef }) => {
         // Phones: the expanded box wouldn't fit there, so it opens as a
         // full-width bar just above the toolbar instead.
         bottom: expanded && isMobile ? "5rem" : "1rem",
-        // Clear of the bottom toolbar (0.5rem + 12.5rem wide, now incl. Forces).
-        left: expanded && isMobile ? "0.5rem" : "13.5rem",
+        // Clear of the bottom toolbar (0.5rem + 16.5rem wide, now incl. Events + Forces).
+        left: expanded && isMobile ? "0.5rem" : "17.5rem",
         height: "3rem",
         width: expanded ? (isMobile ? "calc(100vw - 1rem)" : "17rem") : "3rem",
         overflow: "visible",

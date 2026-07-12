@@ -1368,6 +1368,8 @@ const DateWidget = ({
         >
         <button
         type="button"
+        title="Events"
+        aria-label="Toggle the events panel"
         style={{
             ...buttonStyle,
             color: openPanel === "history" ? "#bfdbfe" : buttonStyle.color,
@@ -1418,6 +1420,8 @@ const DateWidget = ({
 
         <button
         type="button"
+        title="Timeline"
+        aria-label="Toggle the timeline panel"
         style={{
             ...buttonStyle,
             color: openPanel === "skip" ? "rgba(196,165,255,0.9)" : buttonStyle.color,

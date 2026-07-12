@@ -227,6 +227,9 @@ const ActionsPanel = ({ isOpen, onClose, onOpenAdvisor }) => {
     const [isImproving, setIsImproving] = React.useState(false);
     const [isSuggesting, setIsSuggesting] = React.useState(false);
     const inputRef = React.useRef(null);
+    // Local writes in flight; while > 0 the poll below must not clobber the
+    // optimistic list with a stale read.
+    const mutatingRef = React.useRef(0);
 
     React.useEffect(() => {
         if (!isOpen) {
@@ -260,6 +263,18 @@ const ActionsPanel = ({ isOpen, onClose, onOpenAdvisor }) => {
                 }
             })
             .catch(() => {});
+
+            // The advisor can queue actions from its own panel — pick them up
+            // live instead of only on the next open.
+            if (mutatingRef.current === 0) {
+                readActionsState({ force: true })
+                .then((saved) => {
+                    if (!cancelled && mutatingRef.current === 0) {
+                        setActions(saved);
+                    }
+                })
+                .catch(() => {});
+            }
         };
 
         fetchGameData();
@@ -273,10 +288,13 @@ const ActionsPanel = ({ isOpen, onClose, onOpenAdvisor }) => {
 
     const persistActions = async (nextActions) => {
         setActions(nextActions);
+        mutatingRef.current += 1;
         try {
             await saveActions(nextActions);
         } catch (error) {
             console.error("Failed to save actions:", error);
+        } finally {
+            mutatingRef.current -= 1;
         }
     };
 

@@ -4,6 +4,8 @@ import ReactMarkdown from "react-markdown";
 import { Chart, registerables } from "chart.js";
 import { sendMessage, startChat, loadHistory } from "../AI/main.jsx";
 import { JSON_URLS, readJson, writeJson } from "../../runtime/assets.js";
+import { parseAdvisorActionBlocks } from "../../runtime/advisorActions.js";
+import { normalizeActionEntry, readActionsState, writeActionsState } from "../../runtime/gameState.js";
 import StatsPane from "./stats.jsx";
 
 Chart.register(...registerables);
@@ -139,6 +141,38 @@ const AdvisorChart = ({ config }) => {
     );
 };
 
+// One-click queue card for an ```action block the advisor proposed. Clicking
+// writes the action straight into the shared Actions list — the whole point is
+// that the player never copies advisor text into the action input by hand.
+const AdvisorActionCard = ({ action, isQueued, isPending, onQueue }) => (
+    <button
+    type="button"
+    disabled={isQueued || isPending}
+    onClick={onQueue}
+    style={{
+        background: isQueued ? "rgba(34,197,94,0.12)" : "rgba(109,40,217,0.16)",
+        border: isQueued ? "1px solid rgba(74,222,128,0.35)" : "1px solid rgba(139,92,246,0.3)",
+        borderRadius: "10px",
+        color: "rgba(255,255,255,0.9)",
+        cursor: isQueued || isPending ? "default" : "pointer",
+        fontFamily: "sans-serif",
+        opacity: isPending ? 0.6 : 1,
+        padding: "0.55rem 0.7rem",
+        textAlign: "left",
+        width: "100%",
+    }}
+    >
+    <div style={{ fontSize: "0.78rem", fontWeight: 700 }}>
+    {isQueued ? `✓ Queued — ${action.title}` : isPending ? `Queuing — ${action.title}` : `➕ ${action.title}`}
+    </div>
+    {action.text && action.text !== action.title && (
+        <div style={{ color: "rgba(255,255,255,0.62)", fontSize: "0.74rem", lineHeight: "1.45", marginTop: "0.18rem" }}>
+        {action.text}
+        </div>
+    )}
+    </button>
+);
+
 const AdvisorButton = ({ isAdvisorOpen, rightShift, onToggle }) => (
     <button onClick={onToggle} style={{
         ...baseStyle,
@@ -254,6 +288,43 @@ const AdvisorPanel = ({ isAdvisorOpen, onClose }) => {
         if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); handleSend(); }
     };
 
+    // Which action blocks are mid-write, keyed "messageIndex:blockIndex".
+    // Queued blocks themselves persist on the message (msg.queuedBlocks) so
+    // reloading the chat can't re-arm an already-queued button.
+    const [pendingQueues, setPendingQueues] = useState(() => new Set());
+
+    const handleQueueAction = async (messageIndex, blockIndex, action) => {
+        const key = `${messageIndex}:${blockIndex}`;
+        if (pendingQueues.has(key)) return;
+
+        const entry = normalizeActionEntry({ ...action, source: "advisor", status: "planned" });
+        if (!entry) {
+            console.warn("[advisor] action block could not be queued:", action);
+            return;
+        }
+
+        setPendingQueues(prev => new Set(prev).add(key));
+        try {
+            const current = await readActionsState({ force: true });
+            await writeActionsState([...current, entry]);
+            setMessages(prev => {
+                const updated = prev.map((msg, i) => i === messageIndex
+                    ? { ...msg, queuedBlocks: [...(msg.queuedBlocks || []), blockIndex] }
+                    : msg);
+                saveMessages(updated);
+                return updated;
+            });
+        } catch (err) {
+            console.error("Failed to queue advisor action:", err);
+        } finally {
+            setPendingQueues(prev => {
+                const next = new Set(prev);
+                next.delete(key);
+                return next;
+            });
+        }
+    };
+
     const formatDate = (dateStr) => {
         if (!dateStr) return "";
         return new Date(dateStr).toLocaleDateString([], { year: "numeric", month: "short", day: "numeric" });
@@ -319,9 +390,14 @@ const AdvisorPanel = ({ isAdvisorOpen, onClose }) => {
         )}
 
         {messages.map((msg, i) => {
-            const { text, chartConfig } = msg.role === "advisor"
+            const parsedChart = msg.role === "advisor"
             ? parseMessage(msg.text)
             : { text: msg.text, chartConfig: null };
+            const { chartConfig } = parsedChart;
+            const { text, actions: actionBlocks } = msg.role === "advisor"
+            ? parseAdvisorActionBlocks(parsedChart.text)
+            : { text: parsedChart.text, actions: [] };
+            const queuedBlocks = new Set(msg.queuedBlocks || []);
             return (
                 <div key={i} style={{ display: "flex", flexDirection: "column", alignItems: msg.role === "user" ? "flex-end" : "flex-start" }}>
                 {msg.role !== "user" && (
@@ -331,7 +407,7 @@ const AdvisorPanel = ({ isAdvisorOpen, onClose }) => {
                 )}
                 {/* Player-typed text stays verbatim under UI translation. */}
                 <div data-no-translate={msg.role === "user" ? "" : undefined} style={{
-                    maxWidth: "90%", width: chartConfig ? "90%" : undefined,
+                    maxWidth: "90%", width: chartConfig || actionBlocks.length > 0 ? "90%" : undefined,
                     padding: "0.6rem 0.85rem",
                     borderRadius: msg.role === "user" ? "12px 12px 2px 12px" : "12px 12px 12px 2px",
                     backgroundColor: msg.role === "user" ? "#3b82f6" : msg.role === "error" ? "rgba(239,68,68,0.2)" : "rgba(255,255,255,0.08)",
@@ -343,6 +419,19 @@ const AdvisorPanel = ({ isAdvisorOpen, onClose }) => {
                     <div className="advisor-markdown"><ReactMarkdown>{text}</ReactMarkdown></div>
                 )}
                 {chartConfig && <AdvisorChart config={chartConfig} />}
+                {actionBlocks.length > 0 && (
+                    <div style={{ display: "flex", flexDirection: "column", gap: "0.4rem", marginTop: text || chartConfig ? "0.6rem" : 0 }}>
+                    {actionBlocks.map((action, blockIndex) => (
+                        <AdvisorActionCard
+                        key={blockIndex}
+                        action={action}
+                        isQueued={queuedBlocks.has(blockIndex)}
+                        isPending={pendingQueues.has(`${i}:${blockIndex}`)}
+                        onQueue={() => handleQueueAction(i, blockIndex, action)}
+                        />
+                    ))}
+                    </div>
+                )}
                 </div>
                 {msg.time && msg.role !== "user" && (
                     <span style={{ fontSize: "0.65rem", color: "rgba(255,255,255,0.3)", marginTop: "0.25rem" }}>

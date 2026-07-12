@@ -865,6 +865,22 @@ async function buildPromptVariables({
     };
 }
 
+// Rides code-side (not in the prompt pack) so scenario packs that shadow the
+// advisor prompt can never drop it — same lesson as the simulation contracts.
+const ADVISOR_ACTION_CONTRACT = [
+    "QUEUING ACTIONS (interface contract — follow exactly):",
+    "You can queue actions directly into the player's Actions list. Never tell the player to copy, paste, or re-type an order.",
+    "Whenever you propose something concrete the player could order — or the player asks you to handle something — append one fenced block per action at the END of your reply:",
+    "```action",
+    "{\"title\": \"Fortify the eastern frontier\", \"text\": \"Raise border forts along the frontier passes and garrison them with veteran troops drawn from the capital reserve.\"}",
+    "```",
+    "- \"title\": at most about 8 words. \"text\": the complete order, self-contained — the simulator sees ONLY this text, so include the who, what and where.",
+    "- Exactly one JSON object per block; add more blocks for more actions (at most 4 per reply). Valid JSON only: double quotes, no comments, no trailing commas.",
+    "- Each block renders as a button the player clicks to confirm, so propose them freely — but do not also restate the same order as plain prose.",
+    "- Do not propose duplicates of actions already queued this round.",
+    "- The blocks do not count toward any reply-length limit, and you must never mention the block syntax or JSON to the player.",
+].join("\n");
+
 async function buildAdvisorSystemPrompt() {
     await ensurePromptsLoaded();
     const [gameData, actionData, chatData, worldData, eventData, advisorData] = await Promise.all([
@@ -886,7 +902,7 @@ async function buildAdvisorSystemPrompt() {
     });
     const helperValues = resolveHelperValues(promptPack.helpers, variables);
 
-    return renderTemplate(promptPack.advisor, { ...variables, ...helperValues });
+    return `${renderTemplate(promptPack.advisor, { ...variables, ...helperValues })}\n\n${ADVISOR_ACTION_CONTRACT}`;
 }
 
 export async function buildDiplomaticSystemPrompt(countries, playerCountry) {

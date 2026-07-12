@@ -40,6 +40,12 @@ import { difficultyDirective } from "../../runtime/difficulty.js";
 import { resolveExpansion } from "../../runtime/expansion.js";
 import { planAiTurn } from "../../runtime/aiTurn.js";
 import { resolveRegionTransfers } from "../../runtime/regionTransferResolver.js";
+import {
+  chunkEvents,
+  mergeImpactsByIndex,
+  normalizeImpactsPayload,
+  validateNarrativePayload,
+} from "./turnPipeline.js";
 
 const CHAT_HINT_PATTERNS = [
   /\bchat\b/i,
@@ -63,25 +69,6 @@ const CHAT_HINT_PATTERNS = [
   /\bсвяз/i,
   /\bчат/i,
   /\bдоговор/i,
-];
-
-const DEFAULT_SUGGESTION_TOPICS = [
-  {
-    title: "Stabilize the domestic front",
-    description: "Keep the home front orderly and reduce the chance of internal drift while outside pressure builds.",
-  },
-  {
-    title: "Shape the diplomatic field",
-    description: "Use talks, signals, and leverage to narrow hostile options before the next crisis hardens.",
-  },
-  {
-    title: "Prepare military leverage",
-    description: "Create visible readiness and practical reserves so rivals must factor your capability into their plans.",
-  },
-  {
-    title: "Secure economic depth",
-    description: "Expand the industrial and fiscal base that decides whether later gambles are sustainable.",
-  },
 ];
 
 const cloneValue = (value) => {
@@ -784,19 +771,39 @@ const runJsonTask = async (taskKey, { fallback, timeoutMs = 240000, userMessage,
     // Without game data the task still runs at its default temperament.
   }
 
+  // `fallback` is OPTIONAL. When a caller passes one (descriptionToAction,
+  // nextSpeaker, the catalyst tasks), a timeout/parse failure degrades to that
+  // deterministic payload. When a caller passes NONE (the jump pipeline, game
+  // master, suggestions — where the user rejected canned data), the failure
+  // THROWS so the caller can abort the turn without mutating any game state.
+  let parsed = null;
+  let failureReason = "";
   try {
     const raw = await withTimeout(
       callAI(systemPrompt, [{ role: "user", parts: [{ text: userMessage }] }]),
       timeoutMs,
       `AI task "${taskKey}" timed out.`,
     );
-    const parsed = extractJsonPayload(raw);
-    if (parsed) {
-      return parsed;
+    parsed = extractJsonPayload(raw);
+    if (!parsed) {
+      failureReason = "response was not parseable JSON";
+      console.warn(
+        `[ai] task "${taskKey}": ${failureReason}${fallback ? " — using the deterministic fallback." : "."}`,
+      );
     }
-    console.warn(`[ai] task "${taskKey}": response was not parseable JSON — using the deterministic fallback.`);
   } catch (error) {
-    console.warn(`[ai] task "${taskKey}" failed (${error?.message || error}) — using the deterministic fallback.`);
+    failureReason = error?.message || String(error);
+    console.warn(
+      `[ai] task "${taskKey}" failed (${failureReason})${fallback ? " — using the deterministic fallback." : "."}`,
+    );
+  }
+
+  if (parsed) {
+    return parsed;
+  }
+
+  if (!fallback) {
+    throw new Error(`AI task "${taskKey}" ${failureReason || "failed"}`);
   }
 
   // Tag fallback payloads (non-enumerable, so it never serializes into saves):
@@ -871,37 +878,6 @@ const inferInviteeNames = async (text, world, playerCountry = "") => {
     .filter((country) => normalizedText.includes(country.name.toLowerCase()))
     .slice(0, 5)
     .map((country) => country.name);
-};
-
-const fallbackActionSuggestions = async (bundle) => {
-  const playerName = await resolvePolityDisplayName(bundle.game.country, bundle.world);
-  const recentTitles = normalizeEvents(bundle.events).slice(-3).map((event) => event.title);
-  const topics = DEFAULT_SUGGESTION_TOPICS.map((topic, index) => {
-    const recentTitle = recentTitles[index];
-    const actions = [
-      normalizeActionEntry({
-        kind: "action",
-        source: "suggested",
-        text: `Issue a concrete order addressing ${recentTitle || topic.title.toLowerCase()} and assign a responsible ministry or command.`,
-        title: recentTitle ? `Respond to ${recentTitle}` : `Act on ${topic.title}`,
-      }),
-      normalizeActionEntry({
-        kind: "action",
-        source: "suggested",
-        text: `Prepare a second-order measure that protects ${playerName} if this line of effort triggers resistance.`,
-        title: "Create a contingency layer",
-      }),
-    ].filter(Boolean);
-
-    return {
-      actions,
-      description: topic.description,
-      id: `fallback-topic-${index}`,
-      title: recentTitle || topic.title,
-    };
-  });
-
-  return { topics };
 };
 
 const fallbackDescriptionToAction = async (rawInput, bundle) => {
@@ -988,105 +964,6 @@ const buildGeneratedChat = async (chatLike, linkEventId, world) => {
     status: "open",
     title: chatLike?.title || `Chat with ${countries.map((country) => country.name).join(", ")}`,
   });
-};
-
-const fallbackJumpSimulation = async ({ bundle, days, mode, targetDate }) => {
-  const playerName = await resolvePolityDisplayName(bundle.game.country, bundle.world);
-  const plannedActions = normalizeActions(bundle.actions).filter((action) => action.status === "planned");
-  const firstThreeActions = plannedActions.slice(0, 3);
-  const events = [];
-
-  // Ancient/FMG scenarios use plain-text or BCE dates dayjs can't parse; fall
-  // back to the current date string instead of the literal "Invalid Date".
-  const baseGameDate = dayjs(bundle.game.gameDate);
-  const advanceGameDate = (dayCount) =>
-    baseGameDate.isValid()
-      ? baseGameDate.add(dayCount, "day").format("YYYY-MM-DD")
-      : normalizeString(bundle.game.gameDate);
-
-  if (firstThreeActions.length > 0) {
-    firstThreeActions.forEach((action, index) => {
-      const eventDate = advanceGameDate(
-        Math.max(1, Math.round(((index + 1) / (firstThreeActions.length + 1)) * Math.max(days, 1))),
-      );
-
-      events.push({
-        date: eventDate,
-        description:
-          action.kind === "chat"
-            ? `${playerName} opens a deliberate diplomatic channel tied to ${action.title.toLowerCase()}, forcing counterparts to weigh terms instead of guessing intent.`
-            : `${playerName} begins implementing ${action.title.toLowerCase()}, producing immediate administrative and political consequences that other powers start to notice.`,
-        impacts: {
-          createdChats:
-            action.kind === "chat" && action.invitees.length > 0 && action.chatStarter
-              ? [
-                  {
-                    countries: action.invitees,
-                    openingMessage: action.chatStarter,
-                    speaker: playerName,
-                    title: action.title,
-                  },
-                ]
-              : [],
-          // The fallback is a degraded turn — it must NOT fabricate ledger
-          // growth or conquests; leave these empty for the real sim to fill.
-          ledgerChanges: [],
-          polityChanges: [],
-          regionTransfers: [],
-        },
-        importance: index === firstThreeActions.length - 1 ? "major" : "minor",
-        kind: action.kind === "chat" ? "diplomacy" : "player",
-        notable: index === firstThreeActions.length - 1,
-        playerRelated: true,
-        title:
-          action.kind === "chat"
-            ? `${playerName} opens a diplomatic channel`
-            : `${playerName} acts on ${action.title.toLowerCase()}`,
-      });
-    });
-  } else {
-    const midpoint = advanceGameDate(Math.max(1, Math.round(Math.max(days, 1) / 2)));
-    events.push({
-      date: midpoint,
-      description: `Foreign ministries and general staffs keep adjusting to the current balance of power while ${playerName} gathers its next move.`,
-      impacts: {
-        createdChats: [],
-        ledgerChanges: [],
-        polityChanges: [],
-        regionTransfers: [],
-      },
-      importance: mode === "auto" ? "major" : "minor",
-      kind: "world",
-      notable: mode === "auto",
-      playerRelated: false,
-      title: "The international balance remains in motion",
-    });
-  }
-
-  const lastEvent = events.at(-1) ?? null;
-  const catalyst = lastEvent
-    ? {
-        choices: [
-          "Press the advantage immediately",
-          "Probe cautiously before committing",
-          "Hold position and gather more intelligence",
-        ],
-        opening: `${lastEvent.title}. ${lastEvent.description}`,
-        premise: `This scene begins as ${lastEvent.title.toLowerCase()} reaches the point where direct judgment matters.`,
-        title: lastEvent.title,
-      }
-    : null;
-
-  return {
-    catalyst,
-    clearActions: true,
-    events,
-    stopDate: targetDate,
-    summary:
-      plannedActions.length > 0
-        ? `${playerName} moves from planning into execution, and the world begins adjusting to the turn's most concrete orders.`
-        : `Time advances without a direct order from ${playerName}, but the wider system keeps shifting and building pressure.`,
-  };
 };
 
 const normalizeGeneratedEvent = (entry, index = 0) => {
@@ -1288,8 +1165,12 @@ const applySimulationResult = async ({
 export const generateActionSuggestions = async ({ force = true } = {}) => {
   const bundle = await readGameStateBundle({ force });
   const variables = await buildTemplateVariables(bundle);
-  const payload = await runJsonTask("actions", {
-    fallback: () => fallbackActionSuggestions(bundle),
+  // No fallback: the user rejected canned suggestions. A failed generation
+  // THROWS a player-facing message; the caller (actions.jsx) shows it without
+  // clearing the suggestions already on screen.
+  let payload;
+  try {
+    payload = await runJsonTask("actions", {
     // The action history rides in the user message (not the editable prompt
     // pack) so scenario-bundled prompts can't lose it: without it the model
     // re-suggests moves the player already made, turn after turn.
@@ -1304,7 +1185,11 @@ export const generateActionSuggestions = async ({ force = true } = {}) => {
       `YOUR NATION'S LEDGER (build on these developments, shore up weak stats):\n${variables.playerLedgerSummary}` +
       buildContinuitySections(variables, { includeDoNotRepeat: false }),
     variables,
-  });
+    });
+  } catch (error) {
+    console.warn(`[ai] action suggestions failed (${error?.message || error}).`);
+    throw new Error("The AI could not produce suggestions — try again.");
+  }
 
   const normalizeTopics = (raw) =>
     normalizeArray(raw)
@@ -1344,12 +1229,11 @@ export const generateActionSuggestions = async ({ force = true } = {}) => {
     Array.isArray(payload) ? payload : payload?.topics ?? payload?.suggestions,
   );
 
-  // A parseable-but-EMPTY answer used to be accepted as "no suggestions were
-  // generated" — the deterministic fallback (which always has topics) now
-  // covers it, same as empty timeline turns.
+  // A parseable-but-EMPTY answer is a failed generation, not "no suggestions":
+  // fail hard so the caller keeps the current suggestions and shows the error.
   if (topics.length === 0) {
-    console.warn("[ai] action suggestions came back empty — using the deterministic fallback.");
-    topics = normalizeTopics((await fallbackActionSuggestions(bundle))?.topics);
+    console.warn("[ai] action suggestions came back empty.");
+    throw new Error("The AI could not produce suggestions — try again.");
   }
 
   const world = normalizeWorldState(await readWorldState());
@@ -1850,7 +1734,75 @@ const CONQUEST_CONTRACT =
   "is annexed or collapsed it is defunct: it must never act, speak, negotiate, or appear as an independent actor in any " +
   "later event — its army and government are gone.";
 
-export const simulateTimelineJump = async ({ days, mode = "jump" } = {}) => {
+// Stage 2 fans out over the turn's events in batches of this size.
+const IMPACT_BATCH_SIZE = 10;
+// Stage 1 (one call, up to 30+ narrated events) gets the long budget; each
+// Stage 2 batch (≤10 events → impacts only) gets a shorter one.
+const STAGE1_TIMEOUT_MS = 300000;
+const STAGE2_TIMEOUT_MS = 180000;
+const JUMP_STAGE_ATTEMPTS = 2;
+
+// A dense, code-keyed roster of every polity the model might touch, so Stage 2's
+// user message names the codes it must use in fromCode/toCode/absorbedBy even if
+// a scenario prompt pack shadowed the system prompt's map description.
+const buildPolityCodeList = async (world) => {
+  const catalog = mergePolityCatalog(await loadCountryNames().catch(() => []), world);
+  const byCode = new Map();
+  for (const entry of catalog) {
+    if (!entry.code) continue;
+    const key = entry.code.toUpperCase();
+    if (!byCode.has(key)) byCode.set(key, entry.name || entry.code);
+  }
+  if (byCode.size === 0) return "No polity codes are recorded.";
+  return Array.from(byCode.entries())
+    .slice(0, 200)
+    .map(([code, name]) => `${code} = ${name}`)
+    .join("\n");
+};
+
+// Stage 2 user message for ONE batch. Carries the impact contracts and the
+// machine context (territory with region ids + polity code list) in the user
+// message, pack-proof, alongside the batch's globally-numbered events. Impacts
+// are keyed back to the whole-turn list by the eventIndex shown here.
+const buildImpactsUserMessage = ({ batch, batchStart, territoryOverridesText, polityCodeList }) => {
+  const numbered = batch
+    .map((event, offset) => {
+      const idx = batchStart + offset;
+      const date = normalizeString(event?.date) || "undated";
+      const title = normalizeString(event?.title);
+      const description = normalizeString(event?.description);
+      return `Event ${idx}: [${date}] ${title}${description ? `\n  ${description}` : ""}`;
+    })
+    .join("\n\n");
+
+  return (
+    "Encode the machine impacts for the already-written events below. Return JSON only in the shape " +
+    '{"impacts":[{"eventIndex":N,...}]}. Use the EXACT eventIndex shown beside each event. Emit an entry ' +
+    "ONLY for events with a real, concrete consequence — an empty impacts array is a valid answer for a calm " +
+    "batch. Do not invent events or restate their text.\n\n" +
+    `EVENTS TO ENCODE:\n${numbered}\n\n` +
+    `${REGION_TRANSFER_CONTRACT} ${LEDGER_CONTRACT} ${CONQUEST_CONTRACT}\n\n` +
+    `CURRENT TERRITORY OVERRIDES (region name [region id] -> owner code):\n${territoryOverridesText}\n\n` +
+    `POLITY CODES (machine code = display name):\n${polityCodeList}`
+  );
+};
+
+// Pax Colonia's turn simulation, reworked into a FAIL-HARD two-stage pipeline.
+// Stage 1 writes the narrative (one call, no impacts). Stage 2 encodes impacts
+// for the resulting events in parallel batches. Any unrecoverable failure THROWS
+// before applySimulationResult runs, so a failed turn mutates NO game state and
+// the UI shows the error — there is no canned fallback turn anymore.
+export const simulateTimelineJump = async ({ days, mode = "jump", onProgress } = {}) => {
+  const report = (label) => {
+    if (typeof onProgress === "function") {
+      try {
+        onProgress(label);
+      } catch {
+        // progress reporting is best-effort and must never break a turn
+      }
+    }
+  };
+
   const bundle = await readGameStateBundle({ force: true });
   const baseColors = await readJson(JSON_URLS.colors, { defaultValue: {}, force: true });
   // Resolve deterministic settlement/conquest first, then let the LLM narrate what already happened.
@@ -1867,59 +1819,115 @@ export const simulateTimelineJump = async ({ days, mode = "jump" } = {}) => {
     : normalizeString(bundle.game.gameDate);
   const variables = await buildTemplateVariables(bundle, { targetDate, deterministicTerritoryChanges: territorySummary });
   const [minEvents, maxEvents] = eventCountRangeForDays(safeDays);
-  let payload = await runJsonTask(mode === "auto" ? "autoJumpForward" : "jumpForward", {
-    fallback: () => fallbackJumpSimulation({ bundle, days: safeDays, mode, targetDate }),
-    // The jump IS the game — let slow (local/reasoning) models finish instead
-    // of silently swapping in the canned fallback after a few seconds. A
-    // long jump can legitimately demand 30+ events of JSON from a reasoning
-    // model, which routinely takes several minutes.
-    timeoutMs: 420000,
-    userMessage:
-      (mode === "auto"
-        ? "Simulate an auto-jump and stop at the next notable or player-relevant event. Return JSON only. " +
-          "Scale the events array to the time actually covered before your stop point: roughly 1-2 events per week, " +
-          "5-7 per month, 10-13 per quarter, up to 29-37 for a full year — spread their dates across the covered period."
-        : `Simulate a standard jump forward to the requested target date. Return JSON only. The "events" array must ` +
-          `contain between ${minEvents} and ${maxEvents} events (this jump covers ${safeDays} days), with their dates ` +
-          `spread across the skipped period.`) +
-      ` ${REGION_TRANSFER_CONTRACT} ${LEDGER_CONTRACT} ${CONQUEST_CONTRACT}` +
-      buildContinuitySections(variables),
-    variables,
-  });
 
-  // A model can answer with VALID but EMPTY JSON (reasoning models told
-  // "JSON only" often emit a bare object). That used to be accepted as a
-  // successful turn of nothing: no events, no summary, an invisible history
-  // entry — the game looked like it "did nothing" with no fallback either.
-  // An empty turn now counts as a failure and takes the fallback path.
-  const emptyTurn =
-    normalizeArray(payload?.events).length === 0 &&
-    !normalizeString(payload?.summary) &&
-    !payload?.catalyst;
-  if (emptyTurn) {
-    console.warn("[ai] jump returned an empty turn — using the deterministic fallback.");
-    payload = await fallbackJumpSimulation({ bundle, days: safeDays, mode, targetDate });
+  // ---- Stage 1: narrative only (no impacts). Up to 2 attempts, then throw. ----
+  report("Writing the chronicle…");
+  const stage1UserMessage =
+    (mode === "auto"
+      ? "Simulate an auto-jump and stop at the next notable or player-relevant event. Return JSON only. " +
+        "Scale the events array to the time actually covered before your stop point: roughly 1-2 events per week, " +
+        "5-7 per month, 10-13 per quarter, up to 29-37 for a full year — spread their dates across the covered period."
+      : `Simulate a standard jump forward to the requested target date. Return JSON only. The "events" array must ` +
+        `contain between ${minEvents} and ${maxEvents} events (this jump covers ${safeDays} days), with their dates ` +
+        `spread across the skipped period.`) +
+    " Write ONLY the narrative for each event (title, description, date) — do NOT include any impacts, region " +
+    "transfers, polity changes, ledger changes, unit operations, or created chats; those consequences are encoded " +
+    "in a separate later step, so leave them out here. Still narrate territorial changes, conquests, construction " +
+    "and battles inside the descriptions, and make sure the narrative covers and resolves every one of the player's " +
+    "planned actions this round." +
+    buildContinuitySections(variables);
+
+  const runStage1Attempt = async () => {
+    const parsed = await runJsonTask(mode === "auto" ? "autoJumpNarrative" : "jumpNarrative", {
+      timeoutMs: STAGE1_TIMEOUT_MS,
+      userMessage: stage1UserMessage,
+      variables,
+    });
+    const check = validateNarrativePayload(parsed);
+    if (!check.ok) {
+      throw new Error(check.reason);
+    }
+    return parsed;
+  };
+
+  let stage1 = null;
+  let stage1Reason = "";
+  for (let attempt = 1; attempt <= JUMP_STAGE_ATTEMPTS; attempt += 1) {
     try {
-      Object.defineProperty(payload, "__fallback", { value: true });
-    } catch {
-      // untagged is still a working turn
+      stage1 = await runStage1Attempt();
+      break;
+    } catch (error) {
+      stage1Reason = error?.message || String(error);
+      console.warn(`[ai] jump narrative attempt ${attempt}/${JUMP_STAGE_ATTEMPTS} failed: ${stage1Reason}`);
     }
   }
+  if (!stage1) {
+    throw new Error(
+      `The AI simulator failed this turn (narrative: ${stage1Reason || "no usable output"}). ` +
+        "Nothing was changed — try the jump again.",
+    );
+  }
 
-  // A fallback turn is a degraded turn (generic events, no real consequences).
-  // Say so instead of passing it off as the simulation — the player can then
-  // simply retry the jump rather than wonder why nothing "took".
-  const usedFallback = Boolean(payload?.__fallback);
+  const events = normalizeArray(stage1.events);
+
+  // ---- Stage 2: impacts per event, in parallel batches. Each batch: 2 tries. ----
+  const territoryOverridesText = await buildTerritorySummary(bundle.world);
+  const polityCodeList = await buildPolityCodeList(bundle.world);
+  const batches = chunkEvents(events, IMPACT_BATCH_SIZE);
+  const totalBatches = batches.length;
+  let batchesDone = 0;
+  report(`Resolving consequences… (batch 0/${totalBatches})`);
+
+  const runBatch = async (batch, batchIndex) => {
+    const batchStart = batchIndex * IMPACT_BATCH_SIZE;
+    const userMessage = buildImpactsUserMessage({ batch, batchStart, territoryOverridesText, polityCodeList });
+
+    let entries = null;
+    let reason = "";
+    for (let attempt = 1; attempt <= JUMP_STAGE_ATTEMPTS; attempt += 1) {
+      try {
+        const parsed = await runJsonTask("jumpImpacts", {
+          timeoutMs: STAGE2_TIMEOUT_MS,
+          userMessage,
+          variables,
+        });
+        // A parseable reply (even with no impacts) is a success — calm batch.
+        entries = normalizeImpactsPayload(parsed, batchStart, batch.length);
+        break;
+      } catch (error) {
+        reason = error?.message || String(error);
+        console.warn(
+          `[ai] jump impacts batch ${batchIndex + 1}/${totalBatches} attempt ${attempt}/${JUMP_STAGE_ATTEMPTS} failed: ${reason}`,
+        );
+      }
+    }
+    if (entries === null) {
+      // One failed batch fails the whole turn — no partial or canned impacts.
+      throw new Error(
+        `The AI simulator failed this turn (impacts batch ${batchIndex + 1}/${totalBatches}: ${reason || "no usable output"}). ` +
+          "Nothing was changed — try the jump again.",
+      );
+    }
+    batchesDone += 1;
+    report(`Resolving consequences… (batch ${batchesDone}/${totalBatches})`);
+    return entries;
+  };
+
+  const batchResults = await Promise.all(batches.map((batch, batchIndex) => runBatch(batch, batchIndex)));
+  const impactEntries = batchResults.flat();
+
+  // Merge impacts back onto the narrative events by GLOBAL index, then feed the
+  // combined result through the unchanged apply path (region resolver + ledger).
+  const mergedEvents = mergeImpactsByIndex(events, impactEntries);
+
+  report("Applying the turn…");
   const result = {
-    catalyst: payload?.catalyst ?? null,
-    clearActions: payload?.clearActions !== false,
-    events: normalizeArray(payload?.events),
+    catalyst: stage1?.catalyst ?? null,
+    clearActions: stage1?.clearActions !== false,
+    events: mergedEvents,
     mode,
-    stopDate: normalizeString(payload?.stopDate) || targetDate,
-    summary:
-      (usedFallback
-        ? "⚠ The AI simulator did not answer this turn (timed out or returned unusable output), so a minimal placeholder turn was generated — your orders were NOT fully simulated. Consider rolling back or jumping again. "
-        : "") + normalizeString(payload?.summary),
+    stopDate: normalizeString(stage1?.stopDate) || targetDate,
+    summary: normalizeString(stage1?.summary),
   };
 
   return applySimulationResult({
@@ -1933,26 +1941,27 @@ export const simulateTimelineJump = async ({ days, mode = "jump" } = {}) => {
   });
 };
 
-export const simulateAutoJump = async ({ days = 365 } = {}) =>
-  simulateTimelineJump({ days, mode: "auto" });
+export const simulateAutoJump = async ({ days = 365, onProgress } = {}) =>
+  simulateTimelineJump({ days, mode: "auto", onProgress });
 
 export const applyGameMasterCommand = async (requestText) => {
   const bundle = await readGameStateBundle({ force: true });
   const baseColors = await readJson(JSON_URLS.colors, { defaultValue: {}, force: true });
   const variables = await buildTemplateVariables(bundle, { gameMasterRequest: requestText });
-  const payload = await runJsonTask("gameMaster", {
-    fallback: () => ({
-      impacts: {
-        polityChanges: [],
-        regionTransfers: [],
-      },
-      summary: "No deterministic GM fallback changes were inferred from the request.",
-    }),
-    userMessage:
-      `Apply the GM request as JSON only. ${REGION_TRANSFER_CONTRACT} ${LEDGER_CONTRACT} ${CONQUEST_CONTRACT}` +
-      buildContinuitySections(variables),
-    variables,
-  });
+  // No fallback: the user rejected canned GM changes. A failed generation THROWS
+  // before any state is written; the cheats-panel runBusy shows the message.
+  let payload;
+  try {
+    payload = await runJsonTask("gameMaster", {
+      userMessage:
+        `Apply the GM request as JSON only. ${REGION_TRANSFER_CONTRACT} ${LEDGER_CONTRACT} ${CONQUEST_CONTRACT}` +
+        buildContinuitySections(variables),
+      variables,
+    });
+  } catch (error) {
+    console.warn(`[ai] game master request failed (${error?.message || error}).`);
+    throw new Error("The AI could not process the game master request — nothing was changed. Try again.");
+  }
 
   const gmEvent = normalizeGeneratedEvent({
     date: bundle.game.gameDate,

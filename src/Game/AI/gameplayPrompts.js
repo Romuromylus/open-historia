@@ -95,6 +95,56 @@ export const PROMPT_SECTION_DEFINITIONS = [
     label: "Auto Time Skip",
     type: "task",
   },
+  // Stage 1 of the two-call jump pipeline (see gameplay.js simulateTimelineJump):
+  // narrative only, no impacts. Same helper context as the legacy jump tasks.
+  {
+    description: "Manual time skip — Stage 1: narrative events only (no impacts).",
+    helpers: [
+      "PLAYER_POLITY",
+      "WORLD_BEFORE_ROUND_ONE_TEXT",
+      "HISTORICAL_PRESET_SIMULATION_RULES",
+      "TARGET_ROUND_DATE",
+      "CURRENT_UNITS",
+      "ALL_EVENTS_WITH_CONSOLIDATION_CATALYSTS",
+      "PLAYER_ACTIONS_THIS_ROUND",
+      "CHATS_NON_CONSOLIDATED_ROUNDS",
+      "DIFFICULTY_DESCRIPTION_JUMP_FORWARD",
+    ],
+    key: "jumpNarrative",
+    label: "Time Skip — Narrative",
+    type: "task",
+  },
+  {
+    description: "Automatic time skip — Stage 1: narrative events only (no impacts).",
+    helpers: [
+      "PLAYER_POLITY",
+      "TARGET_ROUND_DATE",
+      "CURRENT_UNITS",
+      "ALL_EVENTS_WITH_CONSOLIDATION_CATALYSTS",
+      "PLAYER_ACTIONS_THIS_ROUND",
+      "CHATS_NON_CONSOLIDATED_ROUNDS",
+      "DIFFICULTY_DESCRIPTION_JUMP_FORWARD",
+    ],
+    key: "autoJumpNarrative",
+    label: "Auto Time Skip — Narrative",
+    type: "task",
+  },
+  // Stage 2 of the jump pipeline: a terse machine-encoder that turns the already
+  // written events into impacts JSON only. Grounded on the same map/world helpers.
+  {
+    description: "Jump pipeline — Stage 2: encode event impacts (map/world changes) only.",
+    helpers: [
+      "PLAYER_POLITY",
+      "WORLD_BEFORE_ROUND_ONE_TEXT",
+      "HISTORICAL_PRESET_SIMULATION_RULES",
+      "GRAND_MAP_DESCRIPTION_NO_CITY",
+      "NUMBER_OF_REGIONS",
+      "CURRENT_UNITS",
+    ],
+    key: "jumpImpacts",
+    label: "Jump Impacts Encoder",
+    type: "task",
+  },
   {
     description: "Convert raw freeform text into a structured game action.",
     helpers: [
@@ -194,6 +244,13 @@ export const PROMPT_SECTION_BY_KEY = Object.fromEntries(
 
 export const PROMPT_TASK_KEYS = Object.keys(PROMPT_TASK_DEFAULTS);
 
+// Per-task fallback to defaults, keyed off the DEFAULT task list (not the pack).
+// This is what makes the new jump-pipeline task keys (jumpNarrative,
+// autoJumpNarrative, jumpImpacts) safe to add: a scenario-bundled prompt pack
+// shadows a task only when it supplies that exact key, and old packs predate the
+// new keys, so `prompts[key] ?? tasks[key]` is always empty for them and the
+// DEFAULT wins. That shadowing-by-default is deliberate — the staged pipeline
+// must run on the new prompts even inside a scenario that overrode jumpForward.
 export const normalizePromptPack = (rawPrompts) => {
   const prompts = rawPrompts && typeof rawPrompts === "object" ? rawPrompts : {};
   const tasks = prompts.tasks && typeof prompts.tasks === "object" ? prompts.tasks : {};

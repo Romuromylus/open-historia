@@ -220,6 +220,7 @@ const ActionsPanel = ({ isOpen, onClose, onOpenAdvisor }) => {
     const countryDisplayName = useCountryDisplayName(country);
     const [gameDate, setGameDate] = React.useState("the current date");
     const [suggestions, setSuggestions] = React.useState([]);
+    const [suggestionError, setSuggestionError] = React.useState("");
     const [queuedSuggestionIds, setQueuedSuggestionIds] = React.useState(() => new Set());
     const [hasRequestedSuggestions, setHasRequestedSuggestions] = React.useState(false);
     const [isSubmitting, setIsSubmitting] = React.useState(false);
@@ -234,6 +235,7 @@ const ActionsPanel = ({ isOpen, onClose, onOpenAdvisor }) => {
 
         let cancelled = false;
         setSuggestions([]);
+        setSuggestionError("");
         setHasRequestedSuggestions(false);
 
         loadActions().then((saved) => {
@@ -352,13 +354,16 @@ const ActionsPanel = ({ isOpen, onClose, onOpenAdvisor }) => {
 
         setHasRequestedSuggestions(true);
         setIsSuggesting(true);
+        setSuggestionError("");
         try {
             const topics = await generateActionSuggestions({ force: true });
             setSuggestions(topics);
             setQueuedSuggestionIds(new Set());
         } catch (error) {
             console.error("Failed to generate suggestions:", error);
-            setSuggestions([]);
+            // Keep whatever suggestions are already on screen; just surface why
+            // the refresh failed so the player can retry.
+            setSuggestionError(error?.message || "The AI could not produce suggestions — try again.");
         } finally {
             setIsSuggesting(false);
         }
@@ -522,7 +527,23 @@ const ActionsPanel = ({ isOpen, onClose, onOpenAdvisor }) => {
                 scrollbarWidth: "none",
             }}
             >
-            {hasRequestedSuggestions && !isSuggesting && suggestions.length === 0 && (
+            {suggestionError && !isSuggesting && (
+                <p
+                style={{
+                    background: "rgba(127,29,29,0.24)",
+                    border: "1px solid rgba(248,113,113,0.3)",
+                    borderRadius: "10px",
+                    color: "#fecaca",
+                    fontSize: "0.76rem",
+                    lineHeight: "1.45",
+                    margin: 0,
+                    padding: "0.55rem 0.7rem",
+                }}
+                >
+                {suggestionError}
+                </p>
+            )}
+            {hasRequestedSuggestions && !isSuggesting && !suggestionError && suggestions.length === 0 && (
                 <p style={{ color: "rgba(255,255,255,0.35)", fontSize: "0.78rem", fontStyle: "italic", margin: 0 }}>
                 No AI suggestions generated yet.
                 </p>

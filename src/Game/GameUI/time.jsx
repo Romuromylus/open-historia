@@ -855,6 +855,7 @@ const TimelineSkipPanel = ({
     onClose,
     onJump,
     onUndo,
+    progressLabel,
     topOffset,
     undoCount,
 }) => {
@@ -974,6 +975,9 @@ const TimelineSkipPanel = ({
             }}
             >
             <SpinnerRing size={15} />
+            {progressLabel && (
+                <span style={{ color: "rgba(214,226,255,0.7)", fontSize: "0.74rem" }}>{progressLabel}</span>
+            )}
             </div>
         )}
 
@@ -1087,6 +1091,7 @@ const DateWidget = ({
     const [regionLookup, setRegionLookup] = useState(new Map());
     const [localOpenPanel, setLocalOpenPanel] = useState(null);
     const [isLoading, setIsLoading] = useState(false);
+    const [progressLabel, setProgressLabel] = useState("");
     const [error, setError] = useState("");
     const [visibleEventCount, setVisibleEventCount] = useState(1);
     const [undoCount, setUndoCount] = useState(0);
@@ -1195,12 +1200,13 @@ const DateWidget = ({
 
         setPanel("skip");
         setIsLoading(true);
+        setProgressLabel("Writing the chronicle…");
         setError("");
 
         try {
             const result = mode === "auto"
-            ? await simulateAutoJump({ days })
-            : await simulateTimelineJump({ days });
+            ? await simulateAutoJump({ days, onProgress: setProgressLabel })
+            : await simulateTimelineJump({ days, onProgress: setProgressLabel });
             setGameData(result.game);
             setEvents(result.events);
             setWorldState(result.world);
@@ -1211,6 +1217,7 @@ const DateWidget = ({
             setError(jumpError.message || "Failed to simulate timeline jump.");
         } finally {
             setIsLoading(false);
+            setProgressLabel("");
         }
     };
 
@@ -1338,6 +1345,7 @@ const DateWidget = ({
         onClose={() => setPanel(null)}
         onJump={(days) => runJump(days, "jump")}
         onUndo={runUndo}
+        progressLabel={progressLabel}
         topOffset={topOffset}
         undoCount={undoCount}
         />

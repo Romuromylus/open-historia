@@ -46,8 +46,8 @@ import {
   mergeAdjudicationIntoEvents,
   mergeImpactsByIndex,
   normalizeImpactsPayload,
+  normalizePartiesPayload,
   resolveAdjudication,
-  selectBatchPolities,
   validateNarrativePayload,
 } from "./turnPipeline.js";
 
@@ -1744,8 +1744,9 @@ const IMPACT_BATCH_SIZE = 10;
 // Stage 2 batch (≤10 events → impacts only) gets a shorter one.
 const STAGE1_TIMEOUT_MS = 300000;
 const STAGE2_TIMEOUT_MS = 180000;
-// The per-turn territorial adjudicator (one call, whole-turn menu) runs
-// concurrently with the Stage 2 batches and gets its own budget.
+// The per-turn territorial adjudication (conflict scan + closed-menu pick) runs
+// concurrently with the Stage 2 batches; each step gets its own budget.
+const PARTIES_TIMEOUT_MS = 180000;
 const ADJUDICATOR_TIMEOUT_MS = 240000;
 // How many polities' holdings the region menu lists (player always included).
 const ADJUDICATOR_POLITY_CAP = 8;
@@ -1808,6 +1809,22 @@ const buildImpactsUserMessage = ({ batch, batchStart, polityCodeList }) => {
     `POLITY CODES (machine code = display name):\n${polityCodeList}`
   );
 };
+
+// Step A of the adjudication: the conflict scan. The model — not client-side
+// alias matching — decides which polities' holdings changed, so the menu step
+// is scoped by semantics instead of fragile name detection. Pack-proof.
+const buildPartiesUserMessage = ({ numberedEvents, polityCodeList }) =>
+  "Read the turn's events below and decide WHICH polities' territorial holdings changed hands during them. " +
+  "You are a scanner, not a narrator — return JSON only in this exact shape:\n" +
+  '{"parties":["SELJ","BYZ"],"annexations":[{"code":"BULG","absorbedBy":"BYZ","eventIndex":5}]}\n\n' +
+  "- parties: the code of EVERY polity that gained or lost map territory in these events (losers AND gainers). " +
+  "Codes MUST come from the POLITY ROSTER below. An empty array is the correct answer when no territory changed hands.\n" +
+  "- annexations: polities TOTALLY conquered or capitulating (their entire realm changes hands); do not also list " +
+  "them in parties. \"eventIndex\" is the integer shown beside the event that caused it.\n" +
+  "Only report changes the events actually describe: raids, battles without occupation, sieges still in progress, " +
+  "subsidies and diplomacy do NOT move territory; occupation, conquest, cession, capitulation and annexation DO.\n\n" +
+  `NUMBERED EVENTS:\n${numberedEvents}\n\n` +
+  `POLITY ROSTER (machine code = display name):\n${polityCodeList}`;
 
 // The territorial adjudicator's user message: the closed-menu region-ownership
 // pass. Pack-proof (code-side): carries ALL of the turn's numbered events, a
@@ -1953,7 +1970,6 @@ export const simulateTimelineJump = async ({ days, mode = "jump", onProgress } =
   const polityEntries = await buildPolityMatchEntries(bundle.world);
   const fallbackPolityCodes = polityEntries.map((entry) => entry.code).filter(Boolean);
   const polityNameByCode = new Map(polityEntries.map((entry) => [entry.code.toUpperCase(), entry.name]));
-  const playerCode = normalizeString(bundle.game.country);
   const batches = chunkEvents(events, IMPACT_BATCH_SIZE);
   const totalBatches = batches.length;
   let batchesDone = 0;
@@ -1968,28 +1984,6 @@ export const simulateTimelineJump = async ({ days, mode = "jump", onProgress } =
         return `Event ${idx}: [${date}] ${title}${description ? `\n  ${description}` : ""}`;
       })
       .join("\n\n");
-
-  // The closed REGION MENU the adjudicator picks from: the player plus every
-  // polity the FULL turn text mentions (cap ADJUDICATOR_POLITY_CAP), each with
-  // its current holdings as globally-numbered keys.
-  const fullEventText = events
-    .map((event) => `${normalizeString(event?.title)} ${normalizeString(event?.description)}`)
-    .join("\n");
-  const menuPolityCodes = selectBatchPolities({
-    batchText: fullEventText,
-    polityEntries,
-    playerCode,
-    fallbackCodes: fallbackPolityCodes,
-    minPolities: 1,
-    maxPolities: ADJUDICATOR_POLITY_CAP,
-  });
-  const { text: regionMenuText, byKey: regionMenuByKey } = buildRegionMenu({
-    polityCodes: menuPolityCodes,
-    regions: regionCatalog,
-    ownership: stage2Ownership,
-    nameByCode: polityNameByCode,
-    regionCap: ADJUDICATOR_REGION_CAP,
-  });
 
   report(`Resolving consequences… (batch 0/${totalBatches})`);
 
@@ -2028,43 +2022,93 @@ export const simulateTimelineJump = async ({ days, mode = "jump", onProgress } =
     return entries;
   };
 
-  // Territorial adjudicator: 2 attempts, then fail the turn. A parseable reply
-  // with empty arrays is success (a calm turn moved no borders).
-  const runAdjudicator = async () => {
-    report("Adjudicating territory…");
-    const userMessage = buildAdjudicatorUserMessage({
-      numberedEvents: numberEvents(events, 0),
-      regionMenuText,
-      polityCodeList,
-    });
-    let parsed = null;
+  // A jump-stage JSON call with the shared retry/fail-hard contract: 2 attempts,
+  // then throw the player-facing turn failure (before any state is written).
+  const attemptJsonTask = async (taskKey, { userMessage, timeoutMs, failLabel }) => {
     let reason = "";
     for (let attempt = 1; attempt <= JUMP_STAGE_ATTEMPTS; attempt += 1) {
       try {
-        parsed = await runJsonTask("territorialAdjudicator", {
-          timeoutMs: ADJUDICATOR_TIMEOUT_MS,
-          userMessage,
-          variables,
-        });
-        break;
+        const parsed = await runJsonTask(taskKey, { timeoutMs, userMessage, variables });
+        if (parsed) return parsed;
+        reason = "empty reply";
       } catch (error) {
         reason = error?.message || String(error);
-        console.warn(
-          `[ai] territorial adjudicator attempt ${attempt}/${JUMP_STAGE_ATTEMPTS} failed: ${reason}`,
-        );
       }
+      console.warn(`[ai] ${failLabel} attempt ${attempt}/${JUMP_STAGE_ATTEMPTS} failed: ${reason}`);
     }
-    if (!parsed) {
-      throw new Error(
-        `The AI simulator failed this turn (territory: ${reason || "no usable output"}). ` +
-          "Nothing was changed — try the jump again.",
-      );
-    }
-    return resolveAdjudication(parsed, {
-      byKey: regionMenuByKey,
-      eventCount: events.length,
-      validCodes: fallbackPolityCodes,
+    throw new Error(
+      `The AI simulator failed this turn (${failLabel}: ${reason || "no usable output"}). ` +
+        "Nothing was changed — try the jump again.",
+    );
+  };
+
+  // Territorial adjudication, TWO steps so no client-side text matching ever
+  // decides who is on the menu (alias scanning mis-ranked the player's actual
+  // war partner off a capped menu in a live save — "Empire" aliased to the HRE
+  // swallowed every "Byzantine Empire" mention):
+  //   A) conflict scan — the model reads the events and names WHICH polities
+  //      gained/lost territory (roster codes only) plus outright annexations;
+  //   B) closed-menu pick — the menu is built from exactly those parties, and
+  //      the model returns menu keys. Empty results at either step are valid.
+  const runAdjudicator = async () => {
+    report("Scanning for territorial changes…");
+    const scanParsed = await attemptJsonTask("territorialParties", {
+      timeoutMs: PARTIES_TIMEOUT_MS,
+      userMessage: buildPartiesUserMessage({
+        numberedEvents: numberEvents(events, 0),
+        polityCodeList,
+      }),
+      failLabel: "territory scan",
     });
+    const scan = normalizePartiesPayload(scanParsed, {
+      validCodes: fallbackPolityCodes,
+      eventCount: events.length,
+      maxParties: ADJUDICATOR_POLITY_CAP,
+    });
+
+    // Annexed polities need no menu — their whole realm transfers automatically.
+    const annexedCodes = new Set(scan.annexations.map((entry) => entry.code.toUpperCase()));
+    const menuCodes = scan.parties.filter((code) => !annexedCodes.has(code.toUpperCase()));
+    if (menuCodes.length === 0) {
+      return {
+        ...resolveAdjudication(
+          { transfers: [], annexations: scan.annexations },
+          { byKey: new Map(), eventCount: events.length, validCodes: fallbackPolityCodes },
+        ),
+        parties: scan.parties,
+      };
+    }
+
+    const { text: regionMenuText, byKey: regionMenuByKey } = buildRegionMenu({
+      polityCodes: menuCodes,
+      regions: regionCatalog,
+      ownership: stage2Ownership,
+      nameByCode: polityNameByCode,
+      regionCap: ADJUDICATOR_REGION_CAP,
+    });
+
+    report("Adjudicating territory…");
+    const parsed = await attemptJsonTask("territorialAdjudicator", {
+      timeoutMs: ADJUDICATOR_TIMEOUT_MS,
+      userMessage: buildAdjudicatorUserMessage({
+        numberedEvents: numberEvents(events, 0),
+        regionMenuText,
+        polityCodeList,
+      }),
+      failLabel: "territory",
+    });
+    // Step-A annexations lead so resolveAdjudication's first-wins dedupe keeps
+    // them over any duplicate the menu step re-reports.
+    return {
+      ...resolveAdjudication(
+        {
+          transfers: normalizeArray(parsed?.transfers),
+          annexations: [...scan.annexations, ...normalizeArray(parsed?.annexations)],
+        },
+        { byKey: regionMenuByKey, eventCount: events.length, validCodes: fallbackPolityCodes },
+      ),
+      parties: scan.parties,
+    };
   };
 
   const [adjudication, ...batchResults] = await Promise.all([
@@ -2072,6 +2116,17 @@ export const simulateTimelineJump = async ({ days, mode = "jump", onProgress } =
     ...batches.map((batch, batchIndex) => runBatch(batch, batchIndex)),
   ]);
   const impactEntries = batchResults.flat();
+
+  // Persisted turn diagnostics (unknown world keys survive the normalize
+  // spreads): lets an operator verify server-side what the adjudicator was
+  // shown and produced, instead of needing the player's browser console.
+  bundle.world.lastAdjudication = {
+    at: new Date().toISOString(),
+    annexations: normalizeArray(adjudication?.annexations).length,
+    dropped: adjudication?.dropped ?? 0,
+    parties: normalizeArray(adjudication?.parties),
+    transfers: normalizeArray(adjudication?.transfers).length,
+  };
 
   // Fold Stage-2 impacts onto the narrative events by GLOBAL index, then append
   // the adjudicator's already-resolved region transfers and annexations. The

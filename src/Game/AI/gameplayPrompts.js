@@ -160,6 +160,16 @@ export const PROMPT_SECTION_DEFINITIONS = [
     label: "Territorial Adjudicator",
     type: "task",
   },
+  // Adjudication step A — the conflict scan that names WHICH polities gained or
+  // lost territory (semantic detection by the model; replaces client-side alias
+  // matching, which mis-ranked the player's war partner off the capped menu).
+  {
+    description: "Jump pipeline — territory scan: which polities gained/lost land this turn.",
+    helpers: ["PLAYER_POLITY"],
+    key: "territorialParties",
+    label: "Territory Scanner",
+    type: "task",
+  },
   {
     description: "Convert raw freeform text into a structured game action.",
     helpers: [

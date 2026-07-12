@@ -11,6 +11,7 @@ import {
   mergeImpactsByIndex,
   nameTokens,
   normalizeImpactsPayload,
+  normalizePartiesPayload,
   regionOwnerCode,
   resolveAdjudication,
   selectBatchPolities,
@@ -251,12 +252,34 @@ describe("detectPolityCodes", () => {
     assert.deepEqual(detectPolityCodes("BGR sued for peace", POLITIES), ["BGR"]);
   });
 
-  it("returns codes in catalog order, deduped, and ignores empty text", () => {
+  it("ranks codes by mention count (most first), deduped, and ignores empty text", () => {
+    // Bulgaria is mentioned twice, Byzantium once -> Bulgaria outranks it even
+    // though Byzantium comes first in the catalog.
     assert.deepEqual(
       detectPolityCodes("Bulgaria and the Byzantine Empire and Bulgaria again", POLITIES),
-      ["BYZ", "BGR"],
+      ["BGR", "BYZ"],
     );
     assert.deepEqual(detectPolityCodes("", POLITIES), []);
+  });
+
+  it("the war partner mentioned repeatedly outranks a one-off flavor mention", () => {
+    // The live-save bug: a capped menu built in catalog order dropped the
+    // player's actual opponent because flavor events name-dropped other powers.
+    const text =
+      "Bulgaria pushed across the river. The Bulgarian host burned the forts. " +
+      "Bulgaria's tsar rallied the boyars. In the west, the Byzantine Empire signed a trade pact.";
+    assert.deepEqual(detectPolityCodes(text, POLITIES), ["BGR", "BYZ"]);
+  });
+
+  it("matches diacritic variants (Rûm ~ Rum) in both directions", () => {
+    const polities = [{ code: "SELJ", name: "Sultanate of Rum", aliases: ["Rum"] }];
+    assert.deepEqual(detectPolityCodes("the Sultanate of Rûm struck camp", polities), ["SELJ"]);
+    const accented = [{ code: "SELJ", name: "Sultanate of Rûm", aliases: ["Rûm"] }];
+    assert.deepEqual(detectPolityCodes("the Rum frontier stirred", accented), ["SELJ"]);
+  });
+
+  it("still detects suffixed forms via the substring fallback (ranked last)", () => {
+    assert.deepEqual(detectPolityCodes("the Rhomanian themes mustered", POLITIES), ["BYZ"]);
   });
 
   it("does not match a code buried inside a longer word", () => {
@@ -342,6 +365,45 @@ describe("buildRegionMenu", () => {
       nameByCode: new Map([["SRB", "Serbia"]]),
     });
     assert.match(text, /Serbia \(SRB\) — holds no regions on the current map\./);
+  });
+});
+
+describe("normalizePartiesPayload", () => {
+  const OPTS = { validCodes: ["BYZ", "SELJ", "BULG"], eventCount: 10, maxParties: 2 };
+
+  it("canonicalizes roster codes, drops junk, dedupes, and caps parties", () => {
+    const out = normalizePartiesPayload(
+      { parties: ["selj", "SELJ", "BYZ", "BULG", "NOPE", 42, null] },
+      OPTS,
+    );
+    // cap 2: SELJ and BYZ make it, BULG is cut, junk never counts.
+    assert.deepEqual(out.parties, ["SELJ", "BYZ"]);
+    assert.deepEqual(out.annexations, []);
+  });
+
+  it("normalizes annexations (valid codes both sides, clamped index, dedupe by loser)", () => {
+    const out = normalizePartiesPayload(
+      {
+        parties: [],
+        annexations: [
+          { code: "bulg", absorbedBy: "byz", eventIndex: 99 },
+          { code: "BULG", absorbedBy: "SELJ", eventIndex: 1 }, // duplicate loser — first wins
+          { code: "BULG", absorbedBy: "NOPE" }, // invalid victor
+          "junk",
+        ],
+      },
+      OPTS,
+    );
+    assert.deepEqual(out.annexations, [{ absorbedBy: "BYZ", code: "BULG", eventIndex: 9 }]);
+  });
+
+  it("returns empty results for non-object or empty payloads", () => {
+    assert.deepEqual(normalizePartiesPayload(null, OPTS), { annexations: [], parties: [] });
+    assert.deepEqual(normalizePartiesPayload([], OPTS), { annexations: [], parties: [] });
+    assert.deepEqual(normalizePartiesPayload({ parties: [], annexations: [] }, OPTS), {
+      annexations: [],
+      parties: [],
+    });
   });
 });
 

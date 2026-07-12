@@ -161,7 +161,13 @@ export const mergeImpactsByIndex = (events, impactEntries) => {
 // ---------------------------------------------------------------------------
 
 const trimStr = (value) => String(value ?? "").trim();
-const foldStr = (value) => trimStr(value).toLowerCase();
+// Case- AND diacritic-insensitive fold: prose says "Rûm"/"Aydın", catalogs and
+// aliases say "Rum"/"Aydin" — both sides must land on the same string.
+const foldStr = (value) =>
+  trimStr(value)
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase();
 const escapeRegExp = (value) => trimStr(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
 // A region's CURRENT owner — the live override when present, else the stock
@@ -199,14 +205,28 @@ export const sharesNameToken = (a, b, minLen = 4) => {
   return false;
 };
 
-// Which polities does the turn's prose mention? Scans text for each entry's
-// display name / alias (case-insensitive substring, length ≥ 3) or its code
-// (whole-word, case-insensitive). Returns codes in catalog order, deduped.
+// Word-bounded occurrence count of a (folded) needle in the (folded) haystack.
+// Boundaries are non-letter/non-digit so "Rum" counts in "the Rum frontier" but
+// not inside "instrument"; multi-word names count as phrases.
+const countWordMatches = (haystack, needle) => {
+  if (!needle || needle.length < 3) return 0;
+  const re = new RegExp(`(?<![\\p{L}\\p{N}])${escapeRegExp(needle)}(?![\\p{L}\\p{N}])`, "gu");
+  return (haystack.match(re) ?? []).length;
+};
+
+// Which polities does the turn's prose mention — RANKED by how often? Counts
+// word-bounded occurrences of each entry's display name, aliases and code
+// (diacritic/case-folded). Ranking matters because the menu downstream is
+// CAPPED: the war partner mentioned in half the events must outrank a European
+// power name-dropped once in a flavor line, or it falls off the menu and the
+// adjudicator physically cannot transfer its land (the exact bug found in a
+// live save). Suffixed/inflected forms that a word-bounded count misses still
+// register via a substring fallback worth a single mention.
 // polityEntries: [{ code, name, aliases? }].
 export const detectPolityCodes = (text, polityEntries) => {
   const haystack = foldStr(text);
   if (!haystack) return [];
-  const out = [];
+  const ranked = [];
   const seen = new Set();
   for (const entry of asArray(polityEntries)) {
     if (!entry) continue;
@@ -214,28 +234,34 @@ export const detectPolityCodes = (text, polityEntries) => {
     if (!code) continue;
     const key = code.toUpperCase();
     if (seen.has(key)) continue;
+    seen.add(key);
 
-    let hit = false;
-    const name = foldStr(entry.name);
-    if (name.length >= 3 && haystack.includes(name)) hit = true;
-    if (!hit) {
-      for (const alias of asArray(entry.aliases)) {
-        const folded = foldStr(alias);
+    let count = 0;
+    const names = [entry.name, ...asArray(entry.aliases)];
+    for (const raw of names) {
+      count += countWordMatches(haystack, foldStr(raw));
+    }
+    if (code.length >= 2) {
+      count += countWordMatches(haystack, foldStr(code));
+    }
+    if (count === 0) {
+      // Substring fallback preserves the old recall (e.g. "Rhomanian" for the
+      // alias "Rhomania") without letting it inflate the ranking.
+      for (const raw of names) {
+        const folded = foldStr(raw);
         if (folded.length >= 3 && haystack.includes(folded)) {
-          hit = true;
+          count = 1;
           break;
         }
       }
     }
-    if (!hit && code.length >= 2 && new RegExp(`\\b${escapeRegExp(code)}\\b`, "i").test(text)) {
-      hit = true;
-    }
-    if (hit) {
-      seen.add(key);
-      out.push(code);
+    if (count > 0) {
+      ranked.push({ code, count });
     }
   }
-  return out;
+  // Stable sort: equal counts keep catalog order.
+  ranked.sort((a, b) => b.count - a.count);
+  return ranked.map((entry) => entry.code);
 };
 
 // Decide which polities' region menu the turn needs: ALWAYS the player, then
@@ -392,6 +418,57 @@ export const resolveAdjudication = (parsed, { byKey, eventCount, validCodes } = 
   }
 
   return { transfers, annexations, dropped };
+};
+
+// Step-A ("conflict scan") payload of the two-step adjudication: WHICH polities
+// gained or lost territory this turn, plus outright annexations. The model does
+// this detection semantically — client-side alias matching mis-ranked the
+// player's actual war partner off a capped menu in a live save (the HRE's
+// generic alias "Empire" swallowed every "Byzantine Empire" mention). Codes are
+// canonicalized against the roster; junk drops; parties are capped.
+export const normalizePartiesPayload = (parsed, { validCodes = [], eventCount = 0, maxParties = 8 } = {}) => {
+  const codeCanon = new Map();
+  for (const raw of asArray(validCodes)) {
+    const code = trimStr(raw);
+    if (code) codeCanon.set(code.toUpperCase(), code);
+  }
+  const validCode = (value) => codeCanon.get(trimStr(value).toUpperCase()) || "";
+
+  const count = Number.isFinite(eventCount) ? Math.max(0, Math.trunc(eventCount)) : 0;
+  const lastIndex = count > 0 ? count - 1 : 0;
+  const clampIndex = (raw) => {
+    const idx = toInt(raw);
+    if (idx === null || idx < 0 || idx >= count) return lastIndex;
+    return idx;
+  };
+
+  const source = parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  const cap = Number.isFinite(maxParties) && maxParties > 0 ? Math.trunc(maxParties) : 8;
+  const parties = [];
+  const seen = new Set();
+  for (const raw of asArray(source.parties)) {
+    const code = validCode(raw);
+    if (!code) continue;
+    const key = code.toUpperCase();
+    if (seen.has(key) || parties.length >= cap) continue;
+    seen.add(key);
+    parties.push(code);
+  }
+
+  const annexations = [];
+  const seenAnnex = new Set();
+  for (const entry of asArray(source.annexations)) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+    const code = validCode(entry.code);
+    const absorbedBy = validCode(entry.absorbedBy);
+    if (!code || !absorbedBy) continue;
+    const key = code.toUpperCase();
+    if (seenAnnex.has(key)) continue;
+    seenAnnex.add(key);
+    annexations.push({ absorbedBy, code, eventIndex: clampIndex(entry.eventIndex) });
+  }
+
+  return { annexations, parties };
 };
 
 // Expand a whole-polity annexation into per-region transfers: every region the

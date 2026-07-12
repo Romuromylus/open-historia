@@ -15,6 +15,7 @@ import {
 import {
   applyEventImpactsToWorld,
   buildActionDisplayText,
+  LEDGER_STAT_KEYS,
   normalizeActionEntry,
   normalizeActions,
   normalizeChatEntry,
@@ -23,6 +24,7 @@ import {
   normalizeGameData,
   normalizeWorldState,
   readActionsState,
+  summarizePolityLedger,
   readChatsState,
   readEventsState,
   readGameData,
@@ -265,6 +267,165 @@ const resolvePolityDisplayName = async (code, world) => {
   return match?.name || normalizedCode;
 };
 
+// Case-insensitive lookup into a code-keyed map (polityLedgers / polityOverrides).
+// The player code and the codes the model emits don't always match casing, so
+// never trust an exact-key hit alone.
+const findByCodeInsensitive = (map, code) => {
+  const normalized = normalizeString(code);
+  if (!normalized || !map || typeof map !== "object") return null;
+  if (map[normalized]) return map[normalized];
+  const upper = normalized.toUpperCase();
+  for (const [key, value] of Object.entries(map)) {
+    if (String(key).toUpperCase() === upper) return value;
+    if (normalizeString(value?.code).toUpperCase() === upper) return value;
+  }
+  return null;
+};
+
+// Compact ledger view for the world summary: the player's ledger in full, every
+// other still-standing polity's ledger crushed to one line, and every defunct
+// polity listed as gone (its ledger deliberately withheld). Returns "" when no
+// ledgers exist yet so the summary stays unchanged for a fresh game.
+const buildLedgerBlock = async (bundle) => {
+  const world = normalizeWorldState(bundle.world);
+  const ledgers = world.polityLedgers || {};
+  const overrides = world.polityOverrides || {};
+  const playerCode = normalizeString(bundle.game.country);
+  const playerUpper = playerCode.toUpperCase();
+
+  const catalog = mergePolityCatalog(await loadCountryNames().catch(() => []), world);
+  const nameByCode = new Map();
+  for (const entry of catalog) {
+    if (entry.code) nameByCode.set(entry.code.toUpperCase(), entry.name || entry.code);
+  }
+  const nameOf = (code) => {
+    const c = normalizeString(code);
+    if (!c) return "";
+    return nameByCode.get(c.toUpperCase()) || overrides[c]?.name || c;
+  };
+  const statLine = (ledger) =>
+    LEDGER_STAT_KEYS.map((key) => `${key} ${Number(ledger?.stats?.[key] ?? 50)}`).join(" · ");
+
+  // Defunct = an override whose lifecycle status is no longer "active".
+  const defunctCodes = new Set();
+  for (const override of Object.values(overrides)) {
+    if (override?.status && override.status !== "active") {
+      defunctCodes.add(normalizeString(override.code).toUpperCase());
+    }
+  }
+
+  const sections = [];
+
+  const playerLedger = findByCodeInsensitive(ledgers, playerCode);
+  if (playerLedger) {
+    const summary = summarizePolityLedger(playerLedger, { maxDevelopments: 30 });
+    if (summary) {
+      sections.push(`YOUR NATION'S LEDGER (${nameOf(playerCode)}):\n${summary}`);
+    }
+  }
+
+  const OTHER_CAP = 12;
+  const otherLines = [];
+  let overflow = 0;
+  for (const [code, ledger] of Object.entries(ledgers)) {
+    const upper = String(code).toUpperCase();
+    if (upper === playerUpper) continue;
+    if (defunctCodes.has(upper)) continue;
+    if (otherLines.length >= OTHER_CAP) {
+      overflow += 1;
+      continue;
+    }
+    const devCount = normalizeArray(ledger.developments).length;
+    otherLines.push(
+      `- ${nameOf(code)} (${code}): ${statLine(ledger)} — ${devCount} development${devCount === 1 ? "" : "s"}`,
+    );
+  }
+  if (overflow > 0) {
+    otherLines.push(`- …and ${overflow} more polity ledger(s) not listed.`);
+  }
+  if (otherLines.length > 0) {
+    sections.push(`OTHER NATIONS' LEDGERS (compressed):\n${otherLines.join("\n")}`);
+  }
+
+  const defunctLines = [];
+  for (const override of Object.values(overrides)) {
+    if (!override?.status || override.status === "active") continue;
+    const statusLabel = override.status === "annexed" ? "ANNEXED" : override.status === "collapsed" ? "COLLAPSED" : override.status.toUpperCase();
+    const by = override.absorbedBy ? ` by ${nameOf(override.absorbedBy)} (${override.absorbedBy})` : "";
+    defunctLines.push(
+      `- ${nameOf(override.code)} (${override.code}): ${statusLabel}${by} — no longer exists as an independent actor`,
+    );
+  }
+  if (defunctLines.length > 0) {
+    sections.push(
+      `DEFUNCT POLITIES (must never act, speak, negotiate, or appear as independent actors):\n${defunctLines.join("\n")}`,
+    );
+  }
+
+  return sections.join("\n\n");
+};
+
+// The player's own ledger in full, for prompts that steer the player rather than
+// the world (suggestions, stat sheet). "(none)" when nothing is recorded yet.
+const buildPlayerLedgerSummary = (bundle) => {
+  const world = normalizeWorldState(bundle.world);
+  const ledger = findByCodeInsensitive(world.polityLedgers || {}, bundle.game.country);
+  const summary = ledger ? summarizePolityLedger(ledger, { maxDevelopments: 30 }) : "";
+  return summary || "(no national ledger recorded yet)";
+};
+
+// Chronicle of past rounds: the last ~12 simulationHistory summaries as dated
+// lines, OLDEST first / newest last (simulationHistory is stored newest-first).
+// Each summary is trimmed so a long campaign can't balloon the prompt. "" when
+// no rounds have been simulated yet.
+const buildChronicleText = (bundle, { limit = 12, maxChars = 300 } = {}) => {
+  const history = normalizeArray(bundle.world?.simulationHistory);
+  if (history.length === 0) return "";
+
+  return history
+    .slice(0, limit)
+    .reverse()
+    .map((entry) => {
+      const fromDate = normalizeString(entry.fromDate) || "unknown";
+      const toDate = normalizeString(entry.toDate || entry.date) || "unknown";
+      let summary = normalizeString(entry.summary);
+      if (summary.length > maxChars) {
+        summary = `${summary.slice(0, maxChars - 1)}…`;
+      }
+      return `${fromDate} -> ${toDate}: ${summary || "(no summary recorded)"}`;
+    })
+    .join("\n");
+};
+
+// Titles of the last ~30 events — the do-not-repeat list. "" when there are none.
+const buildDoNotRepeatTitles = (bundle, { limit = 30 } = {}) => {
+  const events = normalizeEvents(bundle.events);
+  if (events.length === 0) return "";
+  return events
+    .slice(-limit)
+    .map((event) => `- ${normalizeString(event.title) || "(untitled)"}`)
+    .join("\n");
+};
+
+// Pack-proof continuity block appended to simulation user messages: the chronicle
+// and (optionally) the do-not-repeat contract. Rides in the user message so a
+// scenario-bundled prompt pack can't strip it. Empty string when there's nothing
+// to say, so early turns stay lean.
+const buildContinuitySections = (variables, { includeDoNotRepeat = true } = {}) => {
+  const parts = [];
+  if (normalizeString(variables.chronicle)) {
+    parts.push(`CHRONICLE OF PAST ROUNDS (oldest first, newest last):\n${variables.chronicle}`);
+  }
+  if (includeDoNotRepeat && normalizeString(variables.doNotRepeatTitles)) {
+    parts.push(
+      "DO NOT REPEAT — these events have ALREADY happened. Every new event must be a FRESH development that " +
+        "advances an ongoing storyline; never re-narrate, restate, or trivially rehash anything in this list or the " +
+        `chronicle above:\n${variables.doNotRepeatTitles}`,
+    );
+  }
+  return parts.length > 0 ? `\n\n${parts.join("\n\n")}` : "";
+};
+
 const buildWorldSummary = async (bundle) => {
   const territorySummary = await buildTerritorySummary(bundle.world);
   const polityOverrides = Object.values(normalizeWorldState(bundle.world).polityOverrides);
@@ -286,6 +447,7 @@ const buildWorldSummary = async (bundle) => {
     : "No active catalyst scene.";
 
   const playerName = await resolvePolityDisplayName(bundle.game.country, bundle.world);
+  const ledgerBlock = await buildLedgerBlock(bundle);
   return [
     `Player polity: ${playerName}${bundle.game.country ? ` (code ${bundle.game.country})` : ""}`,
     `Current round: ${bundle.game.round}`,
@@ -300,6 +462,9 @@ const buildWorldSummary = async (bundle) => {
     politySummary,
     "",
     catalystSummary,
+    // National ledgers (persistent developments + stats) only appear once the
+    // engine has recorded any — omitted entirely for a fresh game.
+    ...(ledgerBlock ? ["", ledgerBlock] : []),
   ].join("\n");
 };
 
@@ -523,6 +688,12 @@ const buildTemplateVariables = async (
         : "0%",
     catalystOpening,
     catalystPremise,
+    // Continuity variables (WP2): the running chronicle of past rounds, the
+    // do-not-repeat title list, and the player's own ledger — all ride into the
+    // simulation user messages so a scenario prompt pack can't drop them.
+    chronicle: buildChronicleText(bundle),
+    doNotRepeatTitles: buildDoNotRepeatTitles(bundle),
+    playerLedgerSummary: buildPlayerLedgerSummary(bundle),
     chatHistory,
     chatHistoryLong: buildDetailedChatHistoryText(bundle.chats),
     chatParticipants,
@@ -857,6 +1028,9 @@ const fallbackJumpSimulation = async ({ bundle, days, mode, targetDate }) => {
                   },
                 ]
               : [],
+          // The fallback is a degraded turn — it must NOT fabricate ledger
+          // growth or conquests; leave these empty for the real sim to fill.
+          ledgerChanges: [],
           polityChanges: [],
           regionTransfers: [],
         },
@@ -877,6 +1051,7 @@ const fallbackJumpSimulation = async ({ bundle, days, mode, targetDate }) => {
       description: `Foreign ministries and general staffs keep adjusting to the current balance of power while ${playerName} gathers its next move.`,
       impacts: {
         createdChats: [],
+        ledgerChanges: [],
         polityChanges: [],
         regionTransfers: [],
       },
@@ -1122,8 +1297,12 @@ export const generateActionSuggestions = async ({ force = true } = {}) => {
       "Generate current strategic action suggestions as JSON only. " +
       "Propose FRESH, forward-looking options: never re-suggest an action the player has already taken or queued " +
       "(full history below), and do not rehash topics the event history shows as settled — advance to the NEXT " +
-      "decision each concern calls for. Use polity display names, never internal codes, in all titles and descriptions.\n\n" +
-      `PLAYER ACTION HISTORY (do not repeat any of these):\n${variables.allActions}`,
+      "decision each concern calls for. Build on the nation's EXISTING developments and target its current stat " +
+      "weaknesses (see the ledger below) rather than restarting from scratch. " +
+      "Use polity display names, never internal codes, in all titles and descriptions.\n\n" +
+      `PLAYER ACTION HISTORY (do not repeat any of these):\n${variables.allActions}\n\n` +
+      `YOUR NATION'S LEDGER (build on these developments, shore up weak stats):\n${variables.playerLedgerSummary}` +
+      buildContinuitySections(variables, { includeDoNotRepeat: false }),
     variables,
   });
 
@@ -1268,12 +1447,36 @@ export const generateCountryStats = async ({ code, name } = {}) => {
 
 // Structured national stat sheet for the Stats tab: same grounding as the
 // intelligence briefing, but strict JSON so the UI can render bars and cards.
-export const generateCountryStatSheet = async ({ code, name } = {}) => {
+export const generateCountryStatSheet = async ({ code, name, priorSheet = null } = {}) => {
   const bundle = await readGameStateBundle({ force: true });
   const variables = await buildTemplateVariables(bundle);
   const target = name || code || "the polity";
   const dossier = await buildTargetDossier(bundle, normalizeString(code));
   const era = normalizeString(bundle.world?.simulationRules).slice(0, 700);
+
+  // Ledger + lifecycle status ground the sheet: the numbers should track the
+  // recorded developments and reflect an occupied/annexed polity as such.
+  const world = normalizeWorldState(bundle.world);
+  const targetCode = normalizeString(code);
+  const targetLedger = findByCodeInsensitive(world.polityLedgers || {}, targetCode);
+  const ledgerSummary = targetLedger ? summarizePolityLedger(targetLedger, { maxDevelopments: 30 }) : "";
+  const targetOverride = findByCodeInsensitive(world.polityOverrides || {}, targetCode);
+  const targetStatus = targetOverride?.status || "active";
+
+  // priorSheet anchors evolution: the same code's most recent older sheet, so
+  // the numbers drift plausibly instead of being re-rolled from scratch. Absent
+  // it, the prompt is unchanged from before (aside from the ledger/status which
+  // only appear once the engine has recorded them).
+  let priorSheetJson = "";
+  if (priorSheet && typeof priorSheet === "object") {
+    try {
+      priorSheetJson = JSON.stringify(priorSheet);
+    } catch {
+      priorSheetJson = "";
+    }
+  }
+  const priorSheetDate = normalizeString(priorSheet?.__date || priorSheet?.date);
+
   const system =
     `You are the statistics bureau of an alternate-history strategy game. ` +
     `The current date is ${variables.date || "unknown"}. ` +
@@ -1283,8 +1486,20 @@ export const generateCountryStatSheet = async ({ code, name } = {}) => {
     `Money units must fit the era (barter/tribute-era polities still get best-effort figures).\n\n` +
     (era ? `ERA & WORLD RULES:\n${era}\n\n` : "") +
     `TARGET DOSSIER:\n${dossier || "(nothing recorded)"}\n\n` +
+    (ledgerSummary
+      ? `NATIONAL LEDGER (ground truth — these developments and stats are real and persist across turns):\n${ledgerSummary}\n\n`
+      : "") +
+    (targetStatus !== "active"
+      ? `STATUS: ${target} is ${targetStatus.toUpperCase()}${targetOverride?.absorbedBy ? ` (absorbed by ${targetOverride.absorbedBy})` : ""} — it no longer exists as an independent state. The sheet must reflect occupation/annexation: collapsed sovereignty and internal security, an economy and military folded into or suppressed by the occupier.\n\n`
+      : "") +
     `WORLD STATE:\n${variables.worldSummary || "(no summary)"}\n\n` +
     `RECENT EVENTS:\n${variables.recentEvents || "(none)"}\n\n` +
+    (priorSheetJson
+      ? `PRIOR STAT SHEET${priorSheetDate ? ` (from ${priorSheetDate})` : ""} — evolve plausibly and GRADUALLY from these numbers given the chronicle, ledger and recent events; do NOT re-roll figures at random, preserve continuity:\n${priorSheetJson}\n\n`
+      : "") +
+    (priorSheetJson && normalizeString(variables.chronicle)
+      ? `CHRONICLE OF PAST ROUNDS:\n${variables.chronicle}\n\n`
+      : "") +
     `Respond with ONLY a JSON object — no prose, no markdown fences — exactly this shape:\n` +
     `{"capital":"city","continent":"continent","government":"system · ideology","leader":"head of state/government",` +
     `"stability":0-100 integer,` +
@@ -1608,6 +1823,33 @@ const REGION_TRANSFER_CONTRACT =
   "display names (e.g. \"Germany\"), NEVER by internal codes (e.g. \"GER\") — codes belong only in machine fields " +
   "(regionId, fromCode, toCode, ownerCode, code).";
 
+// Rides the user message alongside REGION_TRANSFER_CONTRACT (same pack-proof
+// reason). Ties durable/material events to the persistent ledger so growth
+// accumulates instead of being re-hallucinated each turn.
+const LEDGER_CONTRACT =
+  "Any event that builds, destroys, or reforms something durable (a building, fortress, canal, port, university, " +
+  "institution, reform, or wonder) OR materially shifts a nation's condition (an economic boom or collapse, a war " +
+  "won or lost, a political upheaval) MUST carry impacts.ledgerChanges. Each entry is " +
+  '{"code":"<polity code>","statChanges":{<any of stability, economy, military, technology, prestige as small integer deltas>},' +
+  '"addDevelopments":[{"name":"","kind":"building|infrastructure|reform|military|wonder|other","regionName":"","note":""}],' +
+  '"removeDevelopments":["<id or exact name of a development that was destroyed>"],"notes":"<short strategic memory, replaces prior notes>"}. ' +
+  "The developments already listed in each nation's ledger are GROUND TRUTH and persist across turns until an event " +
+  "explicitly removes them — never re-create a development that already exists. Stat deltas are SMALL (typically ±1 to " +
+  "±8) and must follow directly from what the event describes; growth is gradual and should compound from existing " +
+  "developments rather than leaping.";
+
+// Rides the user message alongside REGION_TRANSFER_CONTRACT. Teaches the model
+// the one thing the base game never did: decisively beating a nation ends it and
+// hands over ALL of its land in a single whole-polity transfer.
+const CONQUEST_CONTRACT =
+  "A DECISIVE military victory — an enemy capital taken, its field army destroyed, its government capitulating, or its " +
+  "leadership captured — ENDS that nation. When it happens, emit exactly ONE impacts.regionTransfers entry whose " +
+  "regionName is the LOSING polity's DISPLAY NAME (the resolver expands it to every region that polity holds) AND one " +
+  'impacts.polityChanges entry {"code":"<loser code>","status":"annexed","absorbedBy":"<victor code>"}. ' +
+  "A merely PARTIAL victory transfers only the specifically named regions and does NOT annex the polity. Once a polity " +
+  "is annexed or collapsed it is defunct: it must never act, speak, negotiate, or appear as an independent actor in any " +
+  "later event — its army and government are gone.";
+
 export const simulateTimelineJump = async ({ days, mode = "jump" } = {}) => {
   const bundle = await readGameStateBundle({ force: true });
   const baseColors = await readJson(JSON_URLS.colors, { defaultValue: {}, force: true });
@@ -1640,7 +1882,8 @@ export const simulateTimelineJump = async ({ days, mode = "jump" } = {}) => {
         : `Simulate a standard jump forward to the requested target date. Return JSON only. The "events" array must ` +
           `contain between ${minEvents} and ${maxEvents} events (this jump covers ${safeDays} days), with their dates ` +
           `spread across the skipped period.`) +
-      ` ${REGION_TRANSFER_CONTRACT}`,
+      ` ${REGION_TRANSFER_CONTRACT} ${LEDGER_CONTRACT} ${CONQUEST_CONTRACT}` +
+      buildContinuitySections(variables),
     variables,
   });
 
@@ -1705,7 +1948,9 @@ export const applyGameMasterCommand = async (requestText) => {
       },
       summary: "No deterministic GM fallback changes were inferred from the request.",
     }),
-    userMessage: `Apply the GM request as JSON only. ${REGION_TRANSFER_CONTRACT}`,
+    userMessage:
+      `Apply the GM request as JSON only. ${REGION_TRANSFER_CONTRACT} ${LEDGER_CONTRACT} ${CONQUEST_CONTRACT}` +
+      buildContinuitySections(variables),
     variables,
   });
 

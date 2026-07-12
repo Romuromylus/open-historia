@@ -19,6 +19,7 @@ export const WORLD_DEFAULTS = {
   lastJumpSummary: "",
   lastJumpTargetDate: "",
   notes: "",
+  polityLedgers: {},
   polityOverrides: {},
   regionOwnershipOverrides: {},
   simulationHistory: [],
@@ -37,6 +38,19 @@ const UNIT_TYPE_SET = new Set(UNIT_TYPES);
 // "pending" = a player deployment awaiting AI resolution (rendered translucent).
 const UNIT_STATUS_SET = new Set(["idle", "moving", "engaged", "defeated", "pending"]);
 const UNIT_SOURCE_SET = new Set(["player", "ai", "scenario"]);
+
+// Persistent national ledger (world.polityLedgers[code]). Stats are integers
+// 0-100 (default 50); developments are durable improvements that live until an
+// event removes them; notes is short freeform strategic memory. This is the
+// anchor that stops the AI re-hallucinating a country's economy every turn.
+export const LEDGER_STAT_KEYS = ["stability", "economy", "military", "technology", "prestige"];
+const LEDGER_STAT_KEY_SET = new Set(LEDGER_STAT_KEYS);
+export const DEVELOPMENT_KINDS = ["building", "infrastructure", "reform", "military", "wonder", "other"];
+const DEVELOPMENT_KIND_SET = new Set(DEVELOPMENT_KINDS);
+// A polity that is not "active" is DEFUNCT (annexed/collapsed): it no longer
+// acts and its ledger stops being shown.
+export const POLITY_STATUSES = ["active", "annexed", "collapsed"];
+const POLITY_STATUS_SET = new Set(POLITY_STATUSES);
 
 const finiteOrNull = (value) => {
   const num = Number(value);
@@ -95,6 +109,214 @@ const normalizeActionParticipants = (value) =>
   normalizeArray(value)
     .map((entry) => normalizeString(entry))
     .filter(Boolean);
+
+const clampStat = (value) => {
+  const num = Number(value);
+  if (!Number.isFinite(num)) return 50;
+  return Math.max(0, Math.min(100, Math.round(num)));
+};
+
+const normalizeLedgerStats = (value) => {
+  const source = value && typeof value === "object" ? value : {};
+  const stats = {};
+  for (const key of LEDGER_STAT_KEYS) {
+    stats[key] = clampStat(source[key]);
+  }
+  return stats;
+};
+
+// One durable improvement. Name is required (an unnamed development is dropped);
+// kind is coerced into DEVELOPMENT_KINDS with an "other" fallback; id/builtDate
+// stay as given here (a bare id is filled in by the caller when it needs one).
+const normalizeDevelopment = (entry) => {
+  if (!entry || typeof entry !== "object") {
+    return null;
+  }
+
+  const name = normalizeOptionalString(entry.name || entry.title || entry.label);
+  if (!name) {
+    return null;
+  }
+
+  const kind = normalizeString(entry.kind || entry.type).toLowerCase();
+
+  return {
+    builtDate: normalizeOptionalString(entry.builtDate || entry.date),
+    id: normalizeOptionalString(entry.id),
+    kind: DEVELOPMENT_KIND_SET.has(kind) ? kind : "other",
+    name,
+    note: normalizeOptionalString(entry.note),
+    regionName: normalizeOptionalString(entry.regionName || entry.region),
+  };
+};
+
+const normalizePolityStatus = (value, fallback) => {
+  const status = normalizeString(value).toLowerCase();
+  return POLITY_STATUS_SET.has(status) ? status : fallback;
+};
+
+const normalizePolityLedger = (key, value) => {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+
+  const code = normalizeOptionalString(value.code) || normalizeOptionalString(key);
+  if (!code) {
+    return null;
+  }
+
+  return {
+    code,
+    developments: normalizeArray(value.developments)
+      .map((entry) => normalizeDevelopment(entry))
+      .filter(Boolean)
+      // Stored developments always carry a stable id (referenced by removeDevelopments).
+      .map((dev) => ({ ...dev, id: dev.id || generateId("dev") })),
+    notes: normalizeOptionalString(value.notes),
+    stats: normalizeLedgerStats(value.stats),
+    updatedDate: normalizeOptionalString(value.updatedDate),
+  };
+};
+
+// impacts.ledgerChanges[]: one AI-authored mutation to a country's ledger.
+// statChanges are DELTAS (result clamped at apply time) for the 5 known stats
+// only; addDevelopments are appended (id/builtDate assigned at apply time);
+// removeDevelopments match by id OR case-insensitive name; notes REPLACES.
+// A change with no code, or nothing effective to apply, normalizes to null.
+const normalizeLedgerChange = (entry) => {
+  if (!entry || typeof entry !== "object") {
+    return null;
+  }
+
+  const code = normalizeOptionalString(entry.code || entry.id || entry.polityCode);
+  if (!code) {
+    return null;
+  }
+
+  const statChanges = {};
+  const rawStats = entry.statChanges && typeof entry.statChanges === "object" ? entry.statChanges : {};
+  for (const key of LEDGER_STAT_KEYS) {
+    const delta = Number(rawStats[key]);
+    // A zero delta is not a change; unknown stat keys are never read.
+    if (Number.isFinite(delta) && delta !== 0) {
+      statChanges[key] = delta;
+    }
+  }
+
+  const addDevelopments = normalizeArray(entry.addDevelopments)
+    .map((dev) => normalizeDevelopment(dev))
+    .filter(Boolean);
+  const removeDevelopments = normalizeArray(entry.removeDevelopments)
+    .map((token) => normalizeString(token))
+    .filter(Boolean);
+  const notes = normalizeOptionalString(entry.notes);
+
+  const hasChange =
+    Object.keys(statChanges).length > 0 ||
+    addDevelopments.length > 0 ||
+    removeDevelopments.length > 0 ||
+    notes !== "";
+  if (!hasChange) {
+    return null;
+  }
+
+  return { addDevelopments, code, notes, removeDevelopments, statChanges };
+};
+
+const createPolityLedger = (code, date) => ({
+  code,
+  developments: [],
+  notes: "",
+  stats: normalizeLedgerStats(null),
+  updatedDate: date || "",
+});
+
+// Apply one normalized ledgerChange to a polityLedgers map (mutates in place).
+// The ledger is created lazily the first time its code is touched.
+const applyLedgerChangeToLedgers = (polityLedgers, change, eventDate) => {
+  if (!change || !change.code) {
+    return;
+  }
+
+  const date = normalizeOptionalString(eventDate);
+  let ledger = polityLedgers[change.code];
+  if (!ledger || typeof ledger !== "object") {
+    ledger = createPolityLedger(change.code, date);
+    polityLedgers[change.code] = ledger;
+  }
+
+  for (const [key, delta] of Object.entries(change.statChanges ?? {})) {
+    if (!LEDGER_STAT_KEY_SET.has(key)) continue;
+    ledger.stats[key] = clampStat((ledger.stats[key] ?? 50) + delta);
+  }
+
+  for (const dev of normalizeArray(change.addDevelopments)) {
+    ledger.developments.push({
+      ...dev,
+      builtDate: dev.builtDate || date,
+      id: dev.id || generateId("dev"),
+    });
+  }
+
+  if (change.removeDevelopments?.length) {
+    const tokens = new Set(
+      change.removeDevelopments.map((token) => normalizeString(token).toLowerCase()).filter(Boolean),
+    );
+    if (tokens.size > 0) {
+      ledger.developments = ledger.developments.filter(
+        (dev) =>
+          !tokens.has(normalizeString(dev.id).toLowerCase()) &&
+          !tokens.has(normalizeString(dev.name).toLowerCase()),
+      );
+    }
+  }
+
+  if (change.notes) {
+    ledger.notes = change.notes;
+  }
+
+  ledger.updatedDate = date || ledger.updatedDate;
+};
+
+// Compact plain-text block for one polity's ledger (used by the AI world
+// summary). Returns "" for a null/empty ledger.
+export const summarizePolityLedger = (ledger, { maxDevelopments = 30 } = {}) => {
+  if (!ledger || typeof ledger !== "object") {
+    return "";
+  }
+
+  const code = normalizeOptionalString(ledger.code);
+  const stats = normalizeLedgerStats(ledger.stats);
+  const developments = normalizeArray(ledger.developments)
+    .map((entry) => normalizeDevelopment(entry))
+    .filter(Boolean);
+  const notes = normalizeOptionalString(ledger.notes);
+
+  if (!code && developments.length === 0 && notes === "") {
+    return "";
+  }
+
+  const lines = [LEDGER_STAT_KEYS.map((key) => `${key} ${stats[key]}`).join(" · ")];
+
+  const cap = Math.max(0, maxDevelopments);
+  const shown = developments.slice(0, cap);
+  for (const dev of shown) {
+    const meta = [dev.kind];
+    if (dev.builtDate) meta.push(`built ${dev.builtDate}`);
+    let line = `- ${dev.name} (${meta.join(", ")})`;
+    if (dev.note) line += ` — ${dev.note}`;
+    lines.push(line);
+  }
+  if (developments.length > shown.length) {
+    lines.push(`…and ${developments.length - shown.length} more`);
+  }
+
+  if (notes) {
+    lines.push(`Notes: ${notes}`);
+  }
+
+  return lines.join("\n");
+};
 
 export const normalizeActionEntry = (entry, index = 0) => {
   if (typeof entry === "string") {
@@ -409,11 +631,14 @@ const normalizePolityChange = (entry) => {
   }
 
   return {
+    absorbedBy: normalizeOptionalString(entry.absorbedBy),
     aliases: normalizeActionParticipants(entry.aliases || entry.additionalNames),
     code,
     color: normalizeOptionalString(entry.color),
     name: normalizeOptionalString(entry.name || entry.newName),
     note: normalizeOptionalString(entry.note || entry.reason),
+    // "" means "no change" — only a valid status flips a polity's lifecycle.
+    status: normalizePolityStatus(entry.status, ""),
   };
 };
 
@@ -540,6 +765,7 @@ const normalizeEventImpacts = (value) => {
     return {
       actionIds: [],
       createdChats: [],
+      ledgerChanges: [],
       polityChanges: [],
       regionTransfers: [],
       unitOps: [],
@@ -549,6 +775,7 @@ const normalizeEventImpacts = (value) => {
   return {
     actionIds: normalizeActionParticipants(value.actionIds),
     createdChats: normalizeChats(value.createdChats),
+    ledgerChanges: normalizeArray(value.ledgerChanges).map(normalizeLedgerChange).filter(Boolean),
     polityChanges: normalizeArray(value.polityChanges).map(normalizePolityChange).filter(Boolean),
     regionTransfers: normalizeArray(value.regionTransfers).map(normalizeRegionTransfer).filter(Boolean),
     unitOps: normalizeArray(value.unitOps).map(normalizeUnitOp).filter(Boolean),
@@ -631,11 +858,14 @@ const normalizePolityOverride = (key, value) => {
   }
 
   return {
+    absorbedBy: normalizeOptionalString(value.absorbedBy),
     aliases: normalizeActionParticipants(value.aliases || value.additionalNames),
     code,
     color: normalizeOptionalString(value.color),
     name: normalizeOptionalString(value.name || value.label),
     note: normalizeOptionalString(value.note),
+    // Stored polities default to active; a defunct one keeps its recorded status.
+    status: normalizePolityStatus(value.status, "active"),
   };
 };
 
@@ -672,6 +902,16 @@ export const normalizeWorldState = (world) => {
       .filter(([regionId, ownerCode]) => regionId && ownerCode),
   );
 
+  // Re-key by the ledger's own code (the source key is only a fallback), so junk
+  // keys/entries drop and a ledger is always addressable at world.polityLedgers[code].
+  const polityLedgers = {};
+  for (const [key, value] of Object.entries(nextWorld.polityLedgers ?? {})) {
+    const ledger = normalizePolityLedger(key, value);
+    if (ledger) {
+      polityLedgers[ledger.code] = ledger;
+    }
+  }
+
   return {
     ...WORLD_DEFAULTS,
     ...nextWorld,
@@ -682,6 +922,7 @@ export const normalizeWorldState = (world) => {
     lastJumpSummary: normalizeOptionalString(nextWorld.lastJumpSummary),
     lastJumpTargetDate: normalizeOptionalString(nextWorld.lastJumpTargetDate),
     notes: normalizeOptionalString(nextWorld.notes),
+    polityLedgers,
     polityOverrides,
     regionOwnershipOverrides,
     simulationHistory: normalizeArray(nextWorld.simulationHistory)
@@ -815,16 +1056,21 @@ export const applyEventImpactsToWorld = ({ colors = {}, events = [], world }) =>
     for (const change of event.impacts.polityChanges) {
       nextWorld.polityOverrides[change.code] = {
         ...(nextWorld.polityOverrides[change.code] ?? {
+          absorbedBy: "",
           aliases: [],
           code: change.code,
           color: "",
           name: "",
           note: "",
+          status: "active",
         }),
         ...(change.aliases?.length > 0 ? { aliases: change.aliases } : {}),
         ...(change.color ? { color: change.color } : {}),
         ...(change.name ? { name: change.name } : {}),
         ...(change.note ? { note: change.note } : {}),
+        // status "" from a change means "leave lifecycle unchanged".
+        ...(change.status ? { status: change.status } : {}),
+        ...(change.absorbedBy ? { absorbedBy: change.absorbedBy } : {}),
       };
 
       if (change.color) {
@@ -843,6 +1089,10 @@ export const applyEventImpactsToWorld = ({ colors = {}, events = [], world }) =>
 
     if (event.impacts.unitOps?.length) {
       nextWorld.units = applyUnitOps(nextWorld.units, event.impacts.unitOps);
+    }
+
+    for (const change of event.impacts.ledgerChanges) {
+      applyLedgerChangeToLedgers(nextWorld.polityLedgers, change, event.date);
     }
   }
 

@@ -44,6 +44,26 @@ const INDEX_ROWS = [
     { key: "internalSecurity", label: "Internal security", icon: "🛡", color: "#f43f5e" },
 ];
 
+// Persistent ground-truth ledger stats (world.polityLedgers[code].stats) —
+// distinct from the AI-authored sheet above; shown as the "National condition".
+const LEDGER_STRIP_ROWS = [
+    { key: "stability", label: "Stability", color: "#22c55e" },
+    { key: "economy", label: "Economy", color: "#06b6d4" },
+    { key: "military", label: "Military", color: "#f43f5e" },
+    { key: "technology", label: "Technology", color: "#8b5cf6" },
+    { key: "prestige", label: "Prestige", color: "#eab308" },
+];
+
+const DEVELOPMENT_KIND_ICONS = {
+    building: "🏛",
+    infrastructure: "🛤",
+    reform: "📜",
+    military: "⚔",
+    wonder: "✨",
+    other: "🔧",
+};
+const MAX_DEVELOPMENTS_SHOWN = 12;
+
 const sectionTitleStyle = {
     color: "rgba(255,255,255,0.45)",
     fontSize: "0.68rem",
@@ -66,6 +86,18 @@ const Bar = ({ value, color }) => (
     </div>
 );
 
+// Growth arrow vs the previous stored sheet for this country. Hidden when the
+// delta is zero or there is no prior sheet to compare against.
+const DeltaBadge = ({ delta }) => {
+    if (!Number.isFinite(delta) || delta === 0) return null;
+    const up = delta > 0;
+    return (
+        <span data-no-translate style={{ color: up ? "#22c55e" : "#ef4444", fontSize: "0.68rem", fontWeight: 700, marginLeft: "0.35rem" }}>
+        {up ? "▲" : "▼"} {up ? "+" : "-"}{Math.abs(delta)}
+        </span>
+    );
+};
+
 const EconomyCard = ({ label, value, sub, tone }) => (
     <div style={cardStyle}>
     <div style={{ color: "rgba(255,255,255,0.45)", fontSize: "0.62rem", fontWeight: 700, letterSpacing: "0.06em", marginBottom: "0.3rem", textTransform: "uppercase" }}>
@@ -78,11 +110,56 @@ const EconomyCard = ({ label, value, sub, tone }) => (
 
 const stabilityColor = (value) => (value < 40 ? "#ef4444" : value < 70 ? "#f59e0b" : "#22c55e");
 
+// The five numbers deltas are computed from. Stored (compactly) with each cache
+// entry so the arrows survive cache hits and manual re-rolls within a date.
+const extractSheetStats = (sheet) => {
+    if (!sheet || typeof sheet !== "object") return null;
+    const indices = {};
+    for (const row of INDEX_ROWS) indices[row.key] = clamp01(sheet.indices?.[row.key]);
+    return { indices, stability: clamp01(sheet.stability) };
+};
+
+// The most recent stored sheet for the SAME code with a strictly OLDER date.
+// Cache keys are `${gameKey}:${code}`; ISO dates compare lexicographically.
+const findPriorSheet = (gameKey, code, currentDate) => {
+    try {
+        const all = readStoredSheets();
+        const upper = String(code).toUpperCase();
+        let best = null;
+        for (const [key, entry] of Object.entries(all)) {
+            if (!entry || typeof entry !== "object" || !entry.sheet) continue;
+            const parts = String(key).split(":");
+            const keyCode = parts[parts.length - 1];
+            const keyGame = parts.slice(0, -1).join(":");
+            if (keyGame !== String(gameKey)) continue;
+            if (String(keyCode).toUpperCase() !== upper) continue;
+            const date = typeof entry.date === "string" ? entry.date : "";
+            if (!date || (currentDate && date >= currentDate)) continue;
+            if (!best || date > best.date) best = { date, sheet: entry.sheet };
+        }
+        return best;
+    } catch {
+        return null;
+    }
+};
+
+// Case-insensitive lookup into a code-keyed map (ledgers / overrides).
+const lookupByCode = (map, code) => {
+    if (!map || typeof map !== "object" || !code) return null;
+    if (map[code]) return map[code];
+    const upper = String(code).toUpperCase();
+    if (map[upper]) return map[upper];
+    const hit = Object.entries(map).find(([key]) => String(key).toUpperCase() === upper);
+    return hit ? hit[1] : null;
+};
+
 const StatsPane = ({ active }) => {
     const [player, setPlayer] = useState({ code: "", date: "", gameKey: "game" });
     const [targetCode, setTargetCode] = useState("");
     const [polity, setPolity] = useState(null); // world.polityOverrides[target]
-    const [state, setState] = useState({ status: "idle", sheet: null, error: "" });
+    const [ledger, setLedger] = useState(null); // world.polityLedgers[target]
+    const [defunct, setDefunct] = useState(null); // { status, byName } when annexed/collapsed
+    const [state, setState] = useState({ status: "idle", sheet: null, error: "", priorStats: null });
     const [flagFailed, setFlagFailed] = useState(false);
     const displayName = useCountryDisplayName(targetCode);
 
@@ -124,45 +201,92 @@ const StatsPane = ({ active }) => {
         const code = targetCode;
         if (!code) return;
         const cacheKey = `${player.gameKey}:${code}`;
+        const existing = memoryCache.get(cacheKey) ?? readStoredSheets()[cacheKey];
         if (!force) {
-            const cached = memoryCache.get(cacheKey) ?? readStoredSheets()[cacheKey];
-            if (cached && cached.date === player.date && cached.sheet) {
-                memoryCache.set(cacheKey, cached);
-                setState({ status: "ready", sheet: cached.sheet, error: "" });
+            if (existing && existing.date === player.date && existing.sheet) {
+                memoryCache.set(cacheKey, existing);
+                setState({ status: "ready", sheet: existing.sheet, error: "", priorStats: existing.priorStats ?? null });
                 return;
             }
         }
-        setState({ status: "loading", sheet: null, error: "" });
+        setState({ status: "loading", sheet: null, error: "", priorStats: null });
         try {
-            const sheet = await generateCountryStatSheet({ code, name: displayName || code });
-            const entry = { date: player.date, sheet };
+            // Anchor evolution to the same code's most recent older sheet. On a
+            // manual re-roll within the same date there is no older sheet, so we
+            // fall back to the current entry to keep continuity and deltas stable.
+            const prior = findPriorSheet(player.gameKey, code, player.date);
+            let priorSheet;
+            let priorStats = null;
+            if (prior) {
+                priorSheet = { ...prior.sheet, __date: prior.date };
+                priorStats = extractSheetStats(prior.sheet);
+            } else if (existing && existing.date === player.date && existing.sheet) {
+                priorSheet = { ...existing.sheet, __date: existing.date };
+                priorStats = existing.priorStats ?? null;
+            }
+            const sheet = await generateCountryStatSheet({ code, name: displayName || code, priorSheet });
+            const entry = { date: player.date, priorStats, sheet };
             memoryCache.set(cacheKey, entry);
             storeSheet(cacheKey, entry);
             setState((current) =>
-                targetCode === code ? { status: "ready", sheet, error: "" } : current);
+                targetCode === code ? { status: "ready", sheet, error: "", priorStats } : current);
         } catch (error) {
             setState((current) =>
                 targetCode === code
-                    ? { status: "error", sheet: null, error: error?.message || "The stat sheet failed." }
+                    ? { status: "error", sheet: null, error: error?.message || "The stat sheet failed.", priorStats: null }
                     : current);
         }
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [targetCode, player.gameKey, player.date, displayName]);
 
     useEffect(() => {
-        if (!active || !targetCode) return;
+        if (!active || !targetCode) return undefined;
         setFlagFailed(false);
-        loadSheet();
+        setLedger(null);
+        setDefunct(null);
+        let cancelled = false;
         readWorldState({ force: false })
-            .then((world) => setPolity(world?.polityOverrides?.[targetCode] ?? null))
-            .catch(() => setPolity(null));
+            .then((world) => {
+                if (cancelled) return;
+                const overrides = world?.polityOverrides ?? {};
+                const override = lookupByCode(overrides, targetCode);
+                setPolity(override ?? null);
+                setLedger(lookupByCode(world?.polityLedgers, targetCode));
+
+                const status = override?.status === "annexed" || override?.status === "collapsed" ? override.status : "";
+                if (status) {
+                    // Defunct nations have no independent stats — banner only, no sheet.
+                    let byName = "";
+                    if (status === "annexed") {
+                        const by = String(override?.absorbedBy || "").trim();
+                        byName = lookupByCode(overrides, by)?.name || by;
+                    }
+                    setDefunct({ byName, status });
+                    setState({ status: "idle", sheet: null, error: "", priorStats: null });
+                } else {
+                    setDefunct(null);
+                    loadSheet();
+                }
+            })
+            .catch(() => {
+                if (cancelled) return;
+                setPolity(null);
+                setLedger(null);
+                setDefunct(null);
+                loadSheet();
+            });
+        return () => {
+            cancelled = true;
+        };
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [active, targetCode, player.date]);
 
     const sheet = state.sheet;
+    const priorStats = state.priorStats;
     const isPlayer = targetCode && targetCode.toUpperCase() === String(player.code).toUpperCase();
     const flagUrl = polity?.flag || flagImageUrlFromGid(targetCode);
     const initials = String(targetCode).replace(/[^A-Za-z]/g, "").slice(0, 2).toUpperCase() || "??";
+    const developments = Array.isArray(ledger?.developments) ? ledger.developments : [];
 
     const breakdown = useMemo(() => {
         const raw = sheet?.gdpBreakdown ?? {};
@@ -176,6 +300,8 @@ const StatsPane = ({ active }) => {
     }, [sheet]);
 
     const budgetNegative = String(sheet?.economy?.budgetBalance ?? "").trim().startsWith("-");
+    const stabilityValue = clamp01(sheet?.stability);
+    const stabilityDelta = sheet && priorStats ? stabilityValue - priorStats.stability : null;
 
     return (
         <div style={{ display: "flex", flex: 1, flexDirection: "column", minHeight: 0 }}>
@@ -230,7 +356,7 @@ const StatsPane = ({ active }) => {
                 </>
             )}
             </div>
-            {state.status !== "loading" && (
+            {state.status !== "loading" && !defunct && (
                 <button
                 onClick={() => loadSheet({ force: true })}
                 title="Regenerate this stat sheet"
@@ -238,6 +364,13 @@ const StatsPane = ({ active }) => {
                 >↻</button>
             )}
             </div>
+
+            {/* Defunct nations carry no independent stats: banner instead of a sheet. */}
+            {defunct && (
+                <div style={{ backgroundColor: "rgba(239,68,68,0.12)", border: "1px solid #ef4444", borderRadius: "10px", color: "#ef4444", fontSize: "0.85rem", fontWeight: 700, marginTop: "1rem", padding: "0.7rem 0.8rem" }}>
+                {defunct.status === "annexed" ? `Annexed by ${defunct.byName || "another power"}` : "Collapsed"}
+                </div>
+            )}
 
             {state.status === "loading" && (
                 <p style={{ color: "rgba(255,255,255,0.5)", fontSize: "0.82rem", marginTop: "1rem" }}>
@@ -255,6 +388,27 @@ const StatsPane = ({ active }) => {
                 </div>
             )}
 
+            {/* National condition — persistent ground-truth ledger stats. */}
+            {ledger && !defunct && (
+                <>
+                <div style={sectionTitleStyle}>🏛 National condition</div>
+                <div style={{ ...cardStyle, display: "flex", flexDirection: "column", gap: "0.5rem" }}>
+                {LEDGER_STRIP_ROWS.map((row) => {
+                    const value = clamp01(ledger.stats?.[row.key]);
+                    return (
+                        <div key={row.key}>
+                        <div style={{ alignItems: "center", display: "flex", justifyContent: "space-between", marginBottom: "0.25rem" }}>
+                        <span style={{ color: "rgba(255,255,255,0.7)", fontSize: "0.7rem" }}>{row.label}</span>
+                        <span data-no-translate style={{ fontSize: "0.72rem", fontWeight: 800 }}>{value}</span>
+                        </div>
+                        <Bar value={value} color={row.color} />
+                        </div>
+                    );
+                })}
+                </div>
+                </>
+            )}
+
             {sheet && state.status === "ready" && (
                 <>
                 {/* National stability */}
@@ -263,11 +417,12 @@ const StatsPane = ({ active }) => {
                 <span style={{ color: "rgba(255,255,255,0.55)", fontSize: "0.68rem", fontWeight: 700, letterSpacing: "0.08em", textTransform: "uppercase" }}>
                 ⚠ National stability
                 </span>
-                <span data-no-translate style={{ fontSize: "0.85rem", fontWeight: 800 }}>
-                {clamp01(sheet.stability)}/100
+                <span style={{ alignItems: "center", display: "flex", fontSize: "0.85rem", fontWeight: 800 }}>
+                <span data-no-translate>{stabilityValue}/100</span>
+                <DeltaBadge delta={stabilityDelta} />
                 </span>
                 </div>
-                <Bar value={sheet.stability} color={stabilityColor(clamp01(sheet.stability))} />
+                <Bar value={sheet.stability} color={stabilityColor(stabilityValue)} />
                 </div>
 
                 {/* Strategic indices */}
@@ -275,13 +430,17 @@ const StatsPane = ({ active }) => {
                 <div style={{ display: "flex", flexDirection: "column", gap: "0.55rem" }}>
                 {INDEX_ROWS.map((row) => {
                     const value = clamp01(sheet.indices?.[row.key]);
+                    const delta = priorStats ? value - (priorStats.indices?.[row.key] ?? value) : null;
                     return (
                         <div key={row.key} style={cardStyle}>
                         <div style={{ alignItems: "center", display: "flex", justifyContent: "space-between", marginBottom: "0.4rem" }}>
                         <span style={{ color: "rgba(255,255,255,0.8)", fontSize: "0.76rem" }}>
                         {row.icon} {row.label}
                         </span>
-                        <span data-no-translate style={{ fontSize: "0.78rem", fontWeight: 800 }}>{value}%</span>
+                        <span style={{ alignItems: "center", display: "flex", fontSize: "0.78rem", fontWeight: 800 }}>
+                        <span data-no-translate>{value}%</span>
+                        <DeltaBadge delta={delta} />
+                        </span>
                         </div>
                         <Bar value={value} color={row.color} />
                         </div>
@@ -323,6 +482,50 @@ const StatsPane = ({ active }) => {
                     </span>
                 ))}
                 </div>
+                </div>
+                </>
+            )}
+
+            {/* National developments — durable improvements from the ledger. */}
+            {ledger && !defunct && (
+                <>
+                <div style={sectionTitleStyle}>🏗 National developments</div>
+                <div style={cardStyle}>
+                {developments.length === 0 ? (
+                    <div style={{ color: "rgba(255,255,255,0.4)", fontSize: "0.72rem" }}>
+                    No recorded developments yet.
+                    </div>
+                ) : (
+                    <div style={{ display: "flex", flexDirection: "column", gap: "0.5rem" }}>
+                    {developments.slice(0, MAX_DEVELOPMENTS_SHOWN).map((dev, index) => {
+                        const meta = [dev.regionName, dev.builtDate].filter(Boolean);
+                        return (
+                            <div key={dev.id || `${dev.name}-${index}`} style={{ display: "flex", gap: "0.5rem" }}>
+                            <span style={{ flexShrink: 0, fontSize: "0.9rem" }}>
+                            {DEVELOPMENT_KIND_ICONS[dev.kind] || DEVELOPMENT_KIND_ICONS.other}
+                            </span>
+                            <div style={{ minWidth: 0 }}>
+                            <div style={{ color: "rgba(255,255,255,0.85)", fontSize: "0.76rem", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                            {dev.name}
+                            </div>
+                            {meta.length > 0 && (
+                                <div style={{ color: "rgba(255,255,255,0.4)", fontSize: "0.66rem", marginTop: "0.1rem" }}>
+                                {dev.regionName ? <span>{dev.regionName}</span> : null}
+                                {dev.regionName && dev.builtDate ? " · " : null}
+                                {dev.builtDate ? <span data-no-translate>{dev.builtDate}</span> : null}
+                                </div>
+                            )}
+                            </div>
+                            </div>
+                        );
+                    })}
+                    {developments.length > MAX_DEVELOPMENTS_SHOWN && (
+                        <div style={{ color: "rgba(255,255,255,0.4)", fontSize: "0.7rem" }}>
+                        +{developments.length - MAX_DEVELOPMENTS_SHOWN} more
+                        </div>
+                    )}
+                    </div>
+                )}
                 </div>
                 </>
             )}

@@ -4,6 +4,13 @@ import react from '@vitejs/plugin-react'
 
 // https://vite.dev/config/
 export default defineConfig({
+  // Short build stamp for deploy diagnosis: the 7-char Git SHA the image was
+  // built from (EasyPanel passes GIT_SHA; the Dockerfile exports it into the
+  // build env), else "dev" for a local build. Logged once at client startup and
+  // rendered as tiny muted text at the bottom of the timeline panel.
+  define: {
+    __PAX_BUILD__: JSON.stringify(process.env.GIT_SHA?.slice(0, 7) || "dev"),
+  },
   plugins: [
     react({
       babel: {

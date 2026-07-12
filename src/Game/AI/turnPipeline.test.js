@@ -2,17 +2,17 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
 import {
-  buildRegionVocabularyBlock,
-  buildRepairCandidates,
+  buildRegionMenu,
   chunkEvents,
   detectPolityCodes,
-  formatPolityRegionVocabulary,
+  expandAnnexation,
   holdingsForCode,
+  mergeAdjudicationIntoEvents,
   mergeImpactsByIndex,
-  mergeRepairedTransfers,
   nameTokens,
   normalizeImpactsPayload,
   regionOwnerCode,
+  resolveAdjudication,
   selectBatchPolities,
   sharesNameToken,
   validateNarrativePayload,
@@ -100,16 +100,26 @@ describe("validateNarrativePayload", () => {
 });
 
 describe("normalizeImpactsPayload", () => {
-  it("keeps in-range entries and defaults every impact array", () => {
+  it("strips regionTransfers and sanitizes polityChanges, defaulting every array", () => {
     const out = normalizeImpactsPayload(
-      { impacts: [{ eventIndex: 0, regionTransfers: [{ toCode: "POL" }] }] },
+      {
+        impacts: [
+          {
+            eventIndex: 0,
+            regionTransfers: [{ toCode: "POL" }],
+            polityChanges: [{ code: "BUL", status: "annexed", absorbedBy: "BYZ", name: "Rump Bulgaria" }],
+          },
+        ],
+      },
       0,
       10,
     );
     assert.equal(out.length, 1);
     assert.equal(out[0].eventIndex, 0);
-    assert.deepEqual(out[0].regionTransfers, [{ toCode: "POL" }]);
-    assert.deepEqual(out[0].polityChanges, []);
+    // Territory belongs to the adjudicator — the encoder's transfers are dropped.
+    assert.deepEqual(out[0].regionTransfers, []);
+    // A rename survives; status/absorbedBy are stripped so the encoder can't annex.
+    assert.deepEqual(out[0].polityChanges, [{ code: "BUL", name: "Rump Bulgaria" }]);
     assert.deepEqual(out[0].ledgerChanges, []);
     assert.deepEqual(out[0].unitOps, []);
     assert.deepEqual(out[0].createdChats, []);
@@ -139,14 +149,14 @@ describe("normalizeImpactsPayload", () => {
   it("drops duplicate eventIndex, keeping the first", () => {
     const out = normalizeImpactsPayload(
       { impacts: [
-        { eventIndex: 3, regionTransfers: [{ toCode: "FIRST" }] },
-        { eventIndex: 3, regionTransfers: [{ toCode: "SECOND" }] },
+        { eventIndex: 3, ledgerChanges: [{ code: "FIRST" }] },
+        { eventIndex: 3, ledgerChanges: [{ code: "SECOND" }] },
       ] },
       0,
       10,
     );
     assert.equal(out.length, 1);
-    assert.deepEqual(out[0].regionTransfers, [{ toCode: "FIRST" }]);
+    assert.deepEqual(out[0].ledgerChanges, [{ code: "FIRST" }]);
   });
 
   it("coerces junk (missing/NaN index, non-object entries)", () => {
@@ -165,12 +175,14 @@ describe("mergeImpactsByIndex", () => {
     const events = makeEvents(15);
     // Batch 0 covered indices 0-9, batch 1 covered 10-14.
     const batch0 = normalizeImpactsPayload({ impacts: [{ eventIndex: 2, ledgerChanges: [{ code: "A" }] }] }, 0, 10);
-    const batch1 = normalizeImpactsPayload({ impacts: [{ eventIndex: 12, regionTransfers: [{ toCode: "B" }] }] }, 10, 5);
+    const batch1 = normalizeImpactsPayload({ impacts: [{ eventIndex: 12, unitOps: [{ op: "remove", unitId: "u1" }] }] }, 10, 5);
     const merged = mergeImpactsByIndex(events, [...batch0, ...batch1]);
 
     assert.equal(merged.length, 15);
     assert.deepEqual(merged[2].impacts.ledgerChanges, [{ code: "A" }]);
-    assert.deepEqual(merged[12].impacts.regionTransfers, [{ toCode: "B" }]);
+    assert.deepEqual(merged[12].impacts.unitOps, [{ op: "remove", unitId: "u1" }]);
+    // The encoder never moves borders — every event's regionTransfers stay empty.
+    assert.deepEqual(merged[12].impacts.regionTransfers, []);
     // An unmentioned event still gets a full empty impacts object.
     assert.deepEqual(merged[5].impacts, {
       regionTransfers: [],
@@ -183,7 +195,7 @@ describe("mergeImpactsByIndex", () => {
     assert.equal(merged[12].title, "Event 12");
   });
 
-  it("ignores impact entries whose index falls outside the event list", () => {
+  it("carries hand-built entries through unchanged (generic merge, no stripping)", () => {
     const events = makeEvents(3);
     const merged = mergeImpactsByIndex(events, [
       { eventIndex: 0, regionTransfers: [{ toCode: "X" }] },
@@ -282,104 +294,208 @@ describe("selectBatchPolities", () => {
       polityEntries: POLITIES,
       playerCode: "BYZ",
       fallbackCodes: ["A", "B", "C", "D", "E", "F", "G", "H"],
-      maxPolities: 6,
+      maxPolities: 8,
     });
-    assert.equal(codes.length, 6);
+    assert.equal(codes.length, 8);
   });
 });
 
-describe("formatPolityRegionVocabulary / buildRegionVocabularyBlock", () => {
-  it("lists held regions with exact names and ids under a partial-transfer header", () => {
-    const text = formatPolityRegionVocabulary({
-      code: "BYZ",
-      name: "Byzantine Empire",
-      regions: holdingsForCode(REGIONS, OWNERSHIP, "BYZ"),
-    });
-    assert.match(text, /REGIONS HELD BY Byzantine Empire \(BYZ\)/);
-    assert.match(text, /- Aydın \[TUR\.8_1\]/);
-    assert.match(text, /MUST name regions from this list exactly/);
-  });
+describe("buildRegionMenu", () => {
+  const nameByCode = new Map([["BYZ", "Byzantine Empire"], ["BGR", "Bulgaria"]]);
 
-  it("caps the list and reports the overflow count", () => {
-    const many = Array.from({ length: 55 }, (_, i) => ({ id: `R${i}`, name: `Region ${i}` }));
-    const text = formatPolityRegionVocabulary({ code: "BYZ", name: "Byz", regions: many, cap: 50 });
-    assert.match(text, /…and 5 more/);
-  });
-
-  it("notes when a polity holds no attributed regions", () => {
-    const text = formatPolityRegionVocabulary({ code: "SRB", name: "Serbia", regions: [] });
-    assert.match(text, /no regions currently attributed/);
-  });
-
-  it("builds one section per polity code with names from nameByCode", () => {
-    const block = buildRegionVocabularyBlock({
+  it("lists holdings as globally-numbered keys and resolves keys + exact ids", () => {
+    const { text, byKey } = buildRegionMenu({
       polityCodes: ["BYZ", "BGR"],
       regions: REGIONS,
       ownership: OWNERSHIP,
-      nameByCode: new Map([["BYZ", "Byzantine Empire"], ["BGR", "Bulgaria"]]),
+      nameByCode,
     });
-    assert.match(block, /REGIONS HELD BY Byzantine Empire \(BYZ\)/);
-    assert.match(block, /REGIONS HELD BY Bulgaria \(BGR\)/);
-    assert.match(block, /- Plovdiv \[BGR\.5_1\]/);
+    // BYZ contributes R1..R4 (catalog order), BGR contributes R5.
+    assert.match(text, /R1: Aydın \[TUR\.8_1\] — held by Byzantine Empire \(BYZ\)/);
+    assert.match(text, /R5: Plovdiv \[BGR\.5_1\] — held by Bulgaria \(BGR\)/);
+    // Menu keys are case-insensitive and each region's exact id also resolves.
+    assert.deepEqual(byKey.get("R1"), { regionId: "TUR.8_1", ownerCode: "BYZ" });
+    assert.deepEqual(byKey.get("TUR.8_1".toUpperCase()), { regionId: "TUR.8_1", ownerCode: "BYZ" });
+    assert.deepEqual(byKey.get("R5"), { regionId: "BGR.5_1", ownerCode: "BGR" });
+  });
+
+  it("caps regions per polity and reports the overflow count", () => {
+    const many = Array.from({ length: 55 }, (_, i) => ({ id: `X${i}`, name: `Region ${i}`, countryCode: "BYZ" }));
+    const { text, byKey } = buildRegionMenu({
+      polityCodes: ["BYZ"],
+      regions: many,
+      ownership: {},
+      nameByCode,
+      regionCap: 50,
+    });
+    assert.match(text, /…and 5 more region\(s\) held by Byzantine Empire \(BYZ\) not listed here\./);
+    // Only 50 numbered keys are emitted (plus their 50 exact-id aliases).
+    const keyCount = [...byKey.keys()].filter((k) => /^R\d+$/.test(k)).length;
+    assert.equal(keyCount, 50);
+  });
+
+  it("notes a polity that holds no regions", () => {
+    const { text } = buildRegionMenu({
+      polityCodes: ["SRB"],
+      regions: REGIONS,
+      ownership: OWNERSHIP,
+      nameByCode: new Map([["SRB", "Serbia"]]),
+    });
+    assert.match(text, /Serbia \(SRB\) — holds no regions on the current map\./);
   });
 });
 
-describe("buildRepairCandidates", () => {
-  it("offers the fromCode polity's holdings plus token-sharing catalog regions", () => {
-    const candidates = buildRepairCandidates(
-      { regionName: "the Philadelphia theme", fromCode: "BYZ", toCode: "BGR" },
-      { regions: REGIONS, ownership: OWNERSHIP },
+describe("resolveAdjudication", () => {
+  const { byKey } = buildRegionMenu({
+    polityCodes: ["BYZ", "BGR"],
+    regions: REGIONS,
+    ownership: OWNERSHIP,
+    nameByCode: new Map([["BYZ", "Byzantine Empire"], ["BGR", "Bulgaria"]]),
+  });
+  const validCodes = ["BYZ", "BGR", "SRB"];
+
+  it("resolves menu keys (case-insensitive) and exact ids, filling fromCode from the owner", () => {
+    const out = resolveAdjudication(
+      { transfers: [
+        { region: "r1", toCode: "bgr", eventIndex: 0 },
+        { region: "TUR.20_1", toCode: "SRB", eventIndex: 2 },
+      ] },
+      { byKey, eventCount: 3, validCodes },
     );
-    const ids = candidates.map((c) => c.id);
-    // All BYZ holdings appear, and the token match ("Philadelphia") is present.
-    assert.ok(ids.includes("TUR.8_1"));
-    assert.ok(ids.includes("GRC.1_1"));
-  });
-
-  it("dedupes by id and still works with no fromCode (token match only)", () => {
-    const candidates = buildRepairCandidates(
-      { regionName: "Denizli district", toCode: "BGR" },
-      { regions: REGIONS, ownership: OWNERSHIP },
-    );
-    const ids = candidates.map((c) => c.id);
-    assert.deepEqual(ids, ["TUR.20_1"]); // only the token match, once
-  });
-
-  it("returns nothing for an entry with no name and no fromCode", () => {
-    assert.deepEqual(buildRepairCandidates({ toCode: "BGR" }, { regions: REGIONS }), []);
-  });
-});
-
-describe("mergeRepairedTransfers", () => {
-  it("keeps resolved originals and swaps in repairs per event index", () => {
-    const original = [
-      { eventIndex: 0, regionTransfers: [{ regionName: "Aydın", toCode: "BGR" }, { regionName: "Nowhere", toCode: "BGR" }] },
-      { eventIndex: 1, regionTransfers: [{ regionName: "Somewhere", toCode: "SRB" }] },
-    ];
-    const resolvedByIndex = new Map([[0, [{ regionName: "Aydın", toCode: "BGR" }]]]); // event 0 kept one original
-    const repairEntries = [
-      { eventIndex: 0, regionTransfers: [{ regionId: "TUR.20_1", toCode: "BGR" }] },
-    ];
-    const merged = mergeRepairedTransfers(original, resolvedByIndex, repairEntries);
-    // Event 0: kept original + repair; the unresolved "Nowhere" is dropped.
-    assert.deepEqual(merged[0].regionTransfers, [
-      { regionName: "Aydın", toCode: "BGR" },
-      { regionId: "TUR.20_1", toCode: "BGR" },
+    assert.deepEqual(out.transfers, [
+      { eventIndex: 0, regionId: "TUR.8_1", fromCode: "BYZ", toCode: "BGR" },
+      { eventIndex: 2, regionId: "TUR.20_1", fromCode: "BYZ", toCode: "SRB" },
     ]);
-    // Event 1 was not in the repair reply — untouched.
-    assert.deepEqual(merged[1].regionTransfers, [{ regionName: "Somewhere", toCode: "SRB" }]);
+    assert.deepEqual(out.annexations, []);
   });
 
-  it("replaces all transfers when an event had no resolved originals", () => {
-    const original = [{ eventIndex: 4, regionTransfers: [{ regionName: "Ghost", toCode: "BGR" }] }];
-    const repairEntries = [{ eventIndex: 4, regionTransfers: [{ regionId: "TUR.8_1", toCode: "BGR" }] }];
-    const merged = mergeRepairedTransfers(original, new Map(), repairEntries);
-    assert.deepEqual(merged[4 - 4].regionTransfers, [{ regionId: "TUR.8_1", toCode: "BGR" }]);
+  it("drops unknown region keys and invalid target codes, counting them", () => {
+    const out = resolveAdjudication(
+      { transfers: [
+        { region: "R99", toCode: "BGR", eventIndex: 0 },
+        { region: "R1", toCode: "ZZZ", eventIndex: 0 },
+      ] },
+      { byKey, eventCount: 3, validCodes },
+    );
+    assert.deepEqual(out.transfers, []);
+    assert.equal(out.dropped, 2);
   });
 
-  it("accepts an object map or array for resolvedByIndex and leaves unmatched events alone", () => {
-    const original = [{ eventIndex: 2, regionTransfers: [{ regionName: "X", toCode: "BGR" }] }];
-    const merged = mergeRepairedTransfers(original, { 2: [] }, []); // empty repair reply
-    assert.deepEqual(merged[0].regionTransfers, [{ regionName: "X", toCode: "BGR" }]);
+  it("re-attaches an out-of-range eventIndex to the LAST event", () => {
+    const out = resolveAdjudication(
+      { transfers: [{ region: "R1", toCode: "BGR", eventIndex: 99 }] },
+      { byKey, eventCount: 3, validCodes },
+    );
+    assert.equal(out.transfers[0].eventIndex, 2); // clamped to last
+  });
+
+  it("dedupes repeated region ids (first pick wins)", () => {
+    const out = resolveAdjudication(
+      { transfers: [
+        { region: "R1", toCode: "BGR", eventIndex: 0 },
+        { region: "TUR.8_1", toCode: "SRB", eventIndex: 1 }, // same region as R1
+      ] },
+      { byKey, eventCount: 3, validCodes },
+    );
+    assert.equal(out.transfers.length, 1);
+    assert.equal(out.transfers[0].toCode, "BGR");
+    assert.equal(out.dropped, 1);
+  });
+
+  it("resolves and dedupes annexations, validating both codes", () => {
+    const out = resolveAdjudication(
+      { annexations: [
+        { code: "bgr", absorbedBy: "byz", eventIndex: 1 },
+        { code: "BGR", absorbedBy: "BYZ", eventIndex: 2 }, // duplicate loser
+        { code: "SRB", absorbedBy: "ZZZ", eventIndex: 0 }, // invalid victor
+      ] },
+      { byKey, eventCount: 3, validCodes },
+    );
+    assert.deepEqual(out.annexations, [{ eventIndex: 1, code: "BGR", absorbedBy: "BYZ" }]);
+    assert.equal(out.dropped, 2);
+  });
+
+  it("treats empty/absent arrays as a valid empty result", () => {
+    assert.deepEqual(resolveAdjudication({}, { byKey, eventCount: 3, validCodes }), {
+      transfers: [],
+      annexations: [],
+      dropped: 0,
+    });
+    assert.deepEqual(resolveAdjudication({ transfers: [], annexations: [] }, { byKey, eventCount: 3, validCodes }), {
+      transfers: [],
+      annexations: [],
+      dropped: 0,
+    });
+  });
+});
+
+describe("expandAnnexation", () => {
+  it("expands to every held region plus an annexed polity change", () => {
+    const { transfers, polityChanges } = expandAnnexation("BYZ", {
+      regions: REGIONS,
+      ownership: OWNERSHIP,
+      absorbedBy: "BGR",
+    });
+    assert.deepEqual(transfers.map((t) => t.regionId).sort(), ["GRC.1_1", "TUR.20_1", "TUR.33_1", "TUR.8_1"]);
+    for (const transfer of transfers) {
+      assert.equal(transfer.fromCode, "BYZ");
+      assert.equal(transfer.toCode, "BGR");
+      assert.ok(transfer.regionName); // catalog name attached
+    }
+    assert.deepEqual(polityChanges, [{ code: "BYZ", status: "annexed", absorbedBy: "BGR" }]);
+  });
+
+  it("still emits the polity change when the polity holds no regions", () => {
+    const { transfers, polityChanges } = expandAnnexation("SRB", {
+      regions: REGIONS,
+      ownership: OWNERSHIP,
+      absorbedBy: "BYZ",
+    });
+    assert.deepEqual(transfers, []);
+    assert.deepEqual(polityChanges, [{ code: "SRB", status: "annexed", absorbedBy: "BYZ" }]);
+  });
+});
+
+describe("mergeAdjudicationIntoEvents", () => {
+  it("appends resolved transfers (with catalog names) and preserves existing impacts", () => {
+    const events = mergeImpactsByIndex(makeEvents(3), [{ eventIndex: 0, ledgerChanges: [{ code: "A" }] }]);
+    const merged = mergeAdjudicationIntoEvents(
+      events,
+      { transfers: [{ eventIndex: 0, regionId: "TUR.8_1", fromCode: "BYZ", toCode: "BGR" }], annexations: [] },
+      { regions: REGIONS, ownership: OWNERSHIP },
+    );
+    assert.deepEqual(merged[0].impacts.regionTransfers, [
+      { regionId: "TUR.8_1", regionName: "Aydın", fromCode: "BYZ", toCode: "BGR" },
+    ]);
+    // Stage-2 impacts on the same event survive.
+    assert.deepEqual(merged[0].impacts.ledgerChanges, [{ code: "A" }]);
+  });
+
+  it("expands an annexation event into transfers plus the annexed polity change", () => {
+    const events = mergeImpactsByIndex(makeEvents(3), []);
+    const merged = mergeAdjudicationIntoEvents(
+      events,
+      { transfers: [], annexations: [{ eventIndex: 1, code: "BGR", absorbedBy: "BYZ" }] },
+      { regions: REGIONS, ownership: OWNERSHIP },
+    );
+    assert.deepEqual(merged[1].impacts.regionTransfers, [
+      { regionId: "BGR.5_1", regionName: "Plovdiv", fromCode: "BGR", toCode: "BYZ" },
+    ]);
+    assert.deepEqual(merged[1].impacts.polityChanges, [
+      { code: "BGR", status: "annexed", absorbedBy: "BYZ" },
+    ]);
+    // Untouched events keep empty region transfers.
+    assert.deepEqual(merged[0].impacts.regionTransfers, []);
+  });
+
+  it("ignores out-of-range indices and returns events unchanged when nothing resolves", () => {
+    const events = mergeImpactsByIndex(makeEvents(2), []);
+    const merged = mergeAdjudicationIntoEvents(
+      events,
+      { transfers: [{ eventIndex: 99, regionId: "TUR.8_1", toCode: "BGR" }], annexations: [] },
+      { regions: REGIONS, ownership: OWNERSHIP },
+    );
+    assert.deepEqual(merged[0].impacts.regionTransfers, []);
+    assert.deepEqual(merged[1].impacts.regionTransfers, []);
   });
 });

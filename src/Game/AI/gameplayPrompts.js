@@ -145,6 +145,21 @@ export const PROMPT_SECTION_DEFINITIONS = [
     label: "Jump Impacts Encoder",
     type: "task",
   },
+  // Jump pipeline — per-turn territorial adjudicator: picks the regions that
+  // changed hands from a closed menu (built code-side), so the model never
+  // writes a raw region name. Runs concurrently with the Stage 2 impact batches.
+  {
+    description: "Jump pipeline — territorial adjudicator: closed-menu region ownership changes.",
+    helpers: [
+      "PLAYER_POLITY",
+      "WORLD_BEFORE_ROUND_ONE_TEXT",
+      "HISTORICAL_PRESET_SIMULATION_RULES",
+      "NUMBER_OF_REGIONS",
+    ],
+    key: "territorialAdjudicator",
+    label: "Territorial Adjudicator",
+    type: "task",
+  },
   {
     description: "Convert raw freeform text into a structured game action.",
     helpers: [

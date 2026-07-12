@@ -996,6 +996,12 @@ const TimelineSkipPanel = ({
             {error}
             </div>
         )}
+
+        {typeof __PAX_BUILD__ !== "undefined" && (
+            <div style={{ color: "rgba(255,255,255,0.25)", fontSize: "0.6rem", textAlign: "center" }}>
+            build {__PAX_BUILD__}
+            </div>
+        )}
         </PanelChrome>
     );
 };

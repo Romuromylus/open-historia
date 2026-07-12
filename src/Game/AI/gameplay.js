@@ -41,12 +41,12 @@ import { resolveExpansion } from "../../runtime/expansion.js";
 import { planAiTurn } from "../../runtime/aiTurn.js";
 import { resolveRegionTransfers } from "../../runtime/regionTransferResolver.js";
 import {
-  buildRegionVocabularyBlock,
-  buildRepairCandidates,
+  buildRegionMenu,
   chunkEvents,
+  mergeAdjudicationIntoEvents,
   mergeImpactsByIndex,
-  mergeRepairedTransfers,
   normalizeImpactsPayload,
+  resolveAdjudication,
   selectBatchPolities,
   validateNarrativePayload,
 } from "./turnPipeline.js";
@@ -1744,6 +1744,13 @@ const IMPACT_BATCH_SIZE = 10;
 // Stage 2 batch (≤10 events → impacts only) gets a shorter one.
 const STAGE1_TIMEOUT_MS = 300000;
 const STAGE2_TIMEOUT_MS = 180000;
+// The per-turn territorial adjudicator (one call, whole-turn menu) runs
+// concurrently with the Stage 2 batches and gets its own budget.
+const ADJUDICATOR_TIMEOUT_MS = 240000;
+// How many polities' holdings the region menu lists (player always included).
+const ADJUDICATOR_POLITY_CAP = 8;
+// How many regions each polity contributes to the menu before an overflow note.
+const ADJUDICATOR_REGION_CAP = 50;
 const JUMP_STAGE_ATTEMPTS = 2;
 
 // A dense, code-keyed roster of every polity the model might touch, so Stage 2's
@@ -1772,21 +1779,12 @@ const buildPolityCodeList = async (world) => {
 // the encoder to actually emit transfers for narrated territory changes and to
 // spend the real region vocabulary block below instead of inventing archaic or
 // poetic place names the resolver can't match.
-const REGION_GROUNDING_INSTRUCTION =
-  "When an event describes an army taking, seizing, occupying, liberating, or losing territory, you MUST emit the " +
-  "matching impacts.regionTransfers — a narrated conquest with no transfer is an error. For a PARTIAL conquest, each " +
-  "regionName MUST be copied EXACTLY from the REGIONS HELD BY … lists below (or be an exact region id from them); if the " +
-  "narrated place name is archaic, poetic, or a historical exonym, pick the listed region(s) that geographically " +
-  "correspond to it. For a TOTAL conquest of a nation, use that polity's display name as regionName (the resolver " +
-  "expands it to every region it holds), as described above.";
-
-const buildImpactsUserMessage = ({
-  batch,
-  batchStart,
-  territoryOverridesText,
-  polityCodeList,
-  regionVocabularyText = "",
-}) => {
+// Stage 2 user message for ONE batch. Territory is no longer the encoder's job
+// (a separate adjudicator owns every region transfer and annexation — see
+// buildAdjudicatorUserMessage), so this carries only the ledger contract and the
+// polity code roster the encoder needs for ledger/unit/rename fields. Pack-proof:
+// rides in the user message, keyed back to the whole-turn list by eventIndex.
+const buildImpactsUserMessage = ({ batch, batchStart, polityCodeList }) => {
   const numbered = batch
     .map((event, offset) => {
       const idx = batchStart + offset;
@@ -1802,47 +1800,38 @@ const buildImpactsUserMessage = ({
     '{"impacts":[{"eventIndex":N,...}]}. Use the EXACT eventIndex shown beside each event. Emit an entry ' +
     "ONLY for events with a real, concrete consequence — an empty impacts array is a valid answer for a calm " +
     "batch. Do not invent events or restate their text.\n\n" +
+    "DO NOT emit regionTransfers, and DO NOT annex, collapse, or absorb any polity: a SEPARATE territorial " +
+    "adjudicator owns every region change and conquest. polityChanges here are ONLY for a regime change that " +
+    "renames or recolors an existing polity — never carry a status or absorbedBy field.\n\n" +
     `EVENTS TO ENCODE:\n${numbered}\n\n` +
-    `${REGION_TRANSFER_CONTRACT} ${LEDGER_CONTRACT} ${CONQUEST_CONTRACT}\n\n` +
-    `${REGION_GROUNDING_INSTRUCTION}\n\n` +
-    (regionVocabularyText
-      ? `REGION VOCABULARY (use these exact region names/ids for partial transfers):\n${regionVocabularyText}\n\n`
-      : "") +
-    `CURRENT TERRITORY OVERRIDES (region name [region id] -> owner code):\n${territoryOverridesText}\n\n` +
+    `${LEDGER_CONTRACT}\n\n` +
     `POLITY CODES (machine code = display name):\n${polityCodeList}`
   );
 };
 
-// Repair user message: shown after a batch's transfers are dry-run through the
-// resolver and some fail to match. Carries the batch's own events, the failing
-// transfers verbatim, and a tight candidate-region set per failure so the model
-// can re-pick a real region name/id (or a polity display name for a total win).
-const buildImpactsRepairMessage = ({ numberedEvents, unresolvedByIndex, candidatesByKey }) => {
-  const unresolvedBlocks = [];
-  const candidateBlocks = [];
-  for (const [eventIndex, entries] of unresolvedByIndex) {
-    unresolvedBlocks.push(`Event ${eventIndex}:\n${JSON.stringify(entries, null, 2)}`);
-    entries.forEach((entry, offset) => {
-      const requested = normalizeString(entry?.regionName) || normalizeString(entry?.regionId) || "(unnamed)";
-      const candidates = candidatesByKey.get(`${eventIndex}:${offset}`) ?? [];
-      const lines = candidates.length
-        ? candidates.map((region) => `- ${region.name || region.id} [${region.id}]${region.country ? ` (${region.country})` : ""}`).join("\n")
-        : "- (no close candidates — drop this transfer if nothing corresponds)";
-      candidateBlocks.push(`Event ${eventIndex}, requested "${requested}" -> ${normalizeString(entry?.toCode) || "?"}:\n${lines}`);
-    });
-  }
-
-  return (
-    "Some regionTransfers you emitted below could not be matched to any real map region, so the territory did not " +
-    "move. Re-emit ONLY the corrected regionTransfers for the listed events. Choose each regionName/regionId EXACTLY " +
-    "from that entry's CANDIDATE REGIONS (or use a polity's display name as regionName for a total conquest). Drop any " +
-    "transfer that genuinely has no correspondence. Return JSON only in the shape " +
-    '{"impacts":[{"eventIndex":N,"regionTransfers":[...]}]}.\n\n' +
-    `EVENTS:\n${numberedEvents}\n\n` +
-    `UNRESOLVED TRANSFERS (verbatim):\n${unresolvedBlocks.join("\n\n")}\n\n` +
-    `CANDIDATE REGIONS:\n${candidateBlocks.join("\n\n")}`
-  );
-};
+// The territorial adjudicator's user message: the closed-menu region-ownership
+// pass. Pack-proof (code-side): carries ALL of the turn's numbered events, a
+// REGION MENU of each relevant polity's current holdings as globally-numbered
+// keys, the polity roster, the output spec, and the picking rules. The model
+// never writes a region name — it returns menu keys (or exact ids from the menu).
+const buildAdjudicatorUserMessage = ({ numberedEvents, regionMenuText, polityCodeList }) =>
+  "Decide which map regions changed ownership as a result of the turn's events below, choosing ONLY from the " +
+  "REGION MENU. The narrative is already written; you are conservative and only move territory the events actually " +
+  "describe changing hands. Empty arrays are a valid answer.\n\n" +
+  "Return JSON only in this exact shape:\n" +
+  '{"transfers":[{"region":"R17","toCode":"BYZ","eventIndex":3}],\n' +
+  ' "annexations":[{"code":"BUL","absorbedBy":"BYZ","eventIndex":5}]}\n\n' +
+  '"region" MUST be a menu key (R<number>) or an exact region id copied from the menu. "toCode"/"absorbedBy"/"code" ' +
+  "MUST be codes from the POLITY ROSTER. \"eventIndex\" is the integer shown beside the event that caused the change.\n" +
+  "- transfers: one entry per region that changed hands (partial conquests, cessions, occupations, liberations).\n" +
+  "- annexations: a polity that was TOTALLY conquered or capitulated — list it here and do NOT also list its regions " +
+  "as transfers; the game will hand over all of its land automatically.\n" +
+  "Any event narrating an army taking, seizing, occupying, or losing territory MUST produce entries. Pick the menu " +
+  "regions that geographically correspond to the narrated places (archaic, poetic, or exonym names included). NEVER " +
+  "invent a key or id that is not in the menu, and never move a region on a hunch.\n\n" +
+  `NUMBERED EVENTS:\n${numberedEvents}\n\n` +
+  `REGION MENU (pick regions ONLY from here):\n${regionMenuText || "(no regions available)"}\n\n` +
+  `POLITY ROSTER (machine code = display name):\n${polityCodeList}`;
 
 // Code-keyed polity entries ({ code, name, aliases }) for per-batch mention
 // detection: the stock country catalog merged with scenario polity overrides
@@ -1951,13 +1940,15 @@ export const simulateTimelineJump = async ({ days, mode = "jump", onProgress } =
 
   const events = normalizeArray(stage1.events);
 
-  // ---- Stage 2: impacts per event, in parallel batches. Each batch: 2 tries. ----
-  const territoryOverridesText = await buildTerritorySummary(bundle.world);
+  // ---- Stage 2 (impacts) + territorial adjudicator, run CONCURRENTLY. ----
+  // Stage 2 encodes non-territorial impacts (ledger/units/chats/renames) in
+  // parallel batches; the adjudicator decides — once, from a closed menu — which
+  // regions changed hands. Both are folded into one Promise.all. Any failure of
+  // either THROWS before applySimulationResult runs, so a failed turn mutates no
+  // game state (same fail-hard semantics as Stage 1).
   const polityCodeList = await buildPolityCodeList(bundle.world);
-  // Region-vocabulary + repair context, loaded once and shared across batches.
   const stage2World = normalizeWorldState(bundle.world);
   const stage2Ownership = stage2World.regionOwnershipOverrides;
-  const stage2PolityOverrides = stage2World.polityOverrides;
   const regionCatalog = await loadRegionCatalog().catch(() => []);
   const polityEntries = await buildPolityMatchEntries(bundle.world);
   const fallbackPolityCodes = polityEntries.map((entry) => entry.code).filter(Boolean);
@@ -1966,12 +1957,11 @@ export const simulateTimelineJump = async ({ days, mode = "jump", onProgress } =
   const batches = chunkEvents(events, IMPACT_BATCH_SIZE);
   const totalBatches = batches.length;
   let batchesDone = 0;
-  report(`Resolving consequences… (batch 0/${totalBatches})`);
 
-  const numberBatchEvents = (batch, batchStart) =>
-    batch
+  const numberEvents = (list, start = 0) =>
+    list
       .map((event, offset) => {
-        const idx = batchStart + offset;
+        const idx = start + offset;
         const date = normalizeString(event?.date) || "undated";
         const title = normalizeString(event?.title);
         const description = normalizeString(event?.description);
@@ -1979,106 +1969,33 @@ export const simulateTimelineJump = async ({ days, mode = "jump", onProgress } =
       })
       .join("\n\n");
 
-  // Which polities' real region names does THIS batch need? Detected from the
-  // batch prose, plus the player, then formatted into the vocabulary block.
-  const batchRegionVocabulary = (batch) => {
-    if (regionCatalog.length === 0) return "";
-    const batchText = batch
-      .map((event) => `${normalizeString(event?.title)} ${normalizeString(event?.description)}`)
-      .join("\n");
-    const batchPolities = selectBatchPolities({
-      batchText,
-      polityEntries,
-      playerCode,
-      fallbackCodes: fallbackPolityCodes,
-    });
-    return buildRegionVocabularyBlock({
-      polityCodes: batchPolities,
-      regions: regionCatalog,
-      ownership: stage2Ownership,
-      nameByCode: polityNameByCode,
-      regionCap: 50,
-    });
-  };
+  // The closed REGION MENU the adjudicator picks from: the player plus every
+  // polity the FULL turn text mentions (cap ADJUDICATOR_POLITY_CAP), each with
+  // its current holdings as globally-numbered keys.
+  const fullEventText = events
+    .map((event) => `${normalizeString(event?.title)} ${normalizeString(event?.description)}`)
+    .join("\n");
+  const menuPolityCodes = selectBatchPolities({
+    batchText: fullEventText,
+    polityEntries,
+    playerCode,
+    fallbackCodes: fallbackPolityCodes,
+    minPolities: 1,
+    maxPolities: ADJUDICATOR_POLITY_CAP,
+  });
+  const { text: regionMenuText, byKey: regionMenuByKey } = buildRegionMenu({
+    polityCodes: menuPolityCodes,
+    regions: regionCatalog,
+    ownership: stage2Ownership,
+    nameByCode: polityNameByCode,
+    regionCap: ADJUDICATOR_REGION_CAP,
+  });
 
-  // Resolver-feedback repair: after a batch parses, dry-run its transfers over a
-  // throwaway ownership copy; if any fail to resolve, make ONE repair call with
-  // per-failure candidate regions, then splice the corrections back in. Any
-  // failure keeps the originals (the final apply-time resolver still drops the
-  // truly unresolvable ones), so repair is best-effort and never fails the turn.
-  const repairBatchTransfers = async ({ batch, batchStart, entries }) => {
-    if (regionCatalog.length === 0) return entries;
-
-    const flat = [];
-    for (const entry of entries) {
-      for (const transfer of normalizeArray(entry.regionTransfers)) {
-        flat.push({ eventIndex: entry.eventIndex, transfer });
-      }
-    }
-    if (flat.length === 0) return entries;
-
-    const { unresolved } = resolveRegionTransfers(
-      flat.map((item) => item.transfer),
-      { ownership: { ...stage2Ownership }, polityOverrides: stage2PolityOverrides, regions: regionCatalog },
-    );
-    if (unresolved.length === 0) return entries;
-
-    // Reference identity ties each unresolved raw entry back to its event.
-    const unresolvedSet = new Set(unresolved);
-    const resolvedByIndex = new Map();
-    const unresolvedByIndex = new Map();
-    const candidatesByKey = new Map();
-    for (const { eventIndex, transfer } of flat) {
-      if (unresolvedSet.has(transfer)) {
-        if (!unresolvedByIndex.has(eventIndex)) unresolvedByIndex.set(eventIndex, []);
-        const offset = unresolvedByIndex.get(eventIndex).length;
-        unresolvedByIndex.get(eventIndex).push(transfer);
-        candidatesByKey.set(
-          `${eventIndex}:${offset}`,
-          buildRepairCandidates(transfer, { ownership: stage2Ownership, regions: regionCatalog }),
-        );
-      } else {
-        if (!resolvedByIndex.has(eventIndex)) resolvedByIndex.set(eventIndex, []);
-        resolvedByIndex.get(eventIndex).push(transfer);
-      }
-    }
-
-    report("Refining territorial changes…");
-    try {
-      const parsed = await runJsonTask("jumpImpacts", {
-        timeoutMs: 120000,
-        userMessage: buildImpactsRepairMessage({
-          numberedEvents: numberBatchEvents(batch, batchStart),
-          unresolvedByIndex,
-          candidatesByKey,
-        }),
-        variables,
-      });
-      const repairEntries = normalizeImpactsPayload(parsed, batchStart, batch.length).filter((entry) =>
-        unresolvedByIndex.has(entry.eventIndex),
-      );
-      if (repairEntries.length === 0) {
-        console.warn(`[ai] region-transfer repair @${batchStart}: no usable corrections; keeping originals.`);
-        return entries;
-      }
-      return mergeRepairedTransfers(entries, resolvedByIndex, repairEntries);
-    } catch (error) {
-      console.warn(
-        `[ai] region-transfer repair @${batchStart} failed (${error?.message || error}); keeping originals.`,
-      );
-      return entries;
-    }
-  };
+  report(`Resolving consequences… (batch 0/${totalBatches})`);
 
   const runBatch = async (batch, batchIndex) => {
     const batchStart = batchIndex * IMPACT_BATCH_SIZE;
-    const userMessage = buildImpactsUserMessage({
-      batch,
-      batchStart,
-      territoryOverridesText,
-      polityCodeList,
-      regionVocabularyText: batchRegionVocabulary(batch),
-    });
+    const userMessage = buildImpactsUserMessage({ batch, batchStart, polityCodeList });
 
     let entries = null;
     let reason = "";
@@ -2106,18 +2023,64 @@ export const simulateTimelineJump = async ({ days, mode = "jump", onProgress } =
           "Nothing was changed — try the jump again.",
       );
     }
-    entries = await repairBatchTransfers({ batch, batchStart, entries });
     batchesDone += 1;
     report(`Resolving consequences… (batch ${batchesDone}/${totalBatches})`);
     return entries;
   };
 
-  const batchResults = await Promise.all(batches.map((batch, batchIndex) => runBatch(batch, batchIndex)));
+  // Territorial adjudicator: 2 attempts, then fail the turn. A parseable reply
+  // with empty arrays is success (a calm turn moved no borders).
+  const runAdjudicator = async () => {
+    report("Adjudicating territory…");
+    const userMessage = buildAdjudicatorUserMessage({
+      numberedEvents: numberEvents(events, 0),
+      regionMenuText,
+      polityCodeList,
+    });
+    let parsed = null;
+    let reason = "";
+    for (let attempt = 1; attempt <= JUMP_STAGE_ATTEMPTS; attempt += 1) {
+      try {
+        parsed = await runJsonTask("territorialAdjudicator", {
+          timeoutMs: ADJUDICATOR_TIMEOUT_MS,
+          userMessage,
+          variables,
+        });
+        break;
+      } catch (error) {
+        reason = error?.message || String(error);
+        console.warn(
+          `[ai] territorial adjudicator attempt ${attempt}/${JUMP_STAGE_ATTEMPTS} failed: ${reason}`,
+        );
+      }
+    }
+    if (!parsed) {
+      throw new Error(
+        `The AI simulator failed this turn (territory: ${reason || "no usable output"}). ` +
+          "Nothing was changed — try the jump again.",
+      );
+    }
+    return resolveAdjudication(parsed, {
+      byKey: regionMenuByKey,
+      eventCount: events.length,
+      validCodes: fallbackPolityCodes,
+    });
+  };
+
+  const [adjudication, ...batchResults] = await Promise.all([
+    runAdjudicator(),
+    ...batches.map((batch, batchIndex) => runBatch(batch, batchIndex)),
+  ]);
   const impactEntries = batchResults.flat();
 
-  // Merge impacts back onto the narrative events by GLOBAL index, then feed the
-  // combined result through the unchanged apply path (region resolver + ledger).
-  const mergedEvents = mergeImpactsByIndex(events, impactEntries);
+  // Fold Stage-2 impacts onto the narrative events by GLOBAL index, then append
+  // the adjudicator's already-resolved region transfers and annexations. The
+  // combined result feeds the unchanged apply path (region resolver + ledger).
+  const mergedEvents = mergeAdjudicationIntoEvents(
+    mergeImpactsByIndex(events, impactEntries),
+    adjudication,
+    { regions: regionCatalog, ownership: stage2Ownership },
+  );
 
   report("Applying the turn…");
   const result = {

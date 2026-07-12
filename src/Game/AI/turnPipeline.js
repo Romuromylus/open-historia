@@ -61,11 +61,28 @@ export const validateNarrativePayload = (parsed) => {
   return { ok: true, reason: "" };
 };
 
+// The per-turn territorial adjudicator (a SEPARATE call — see gameplay.js) now
+// owns every region transfer and annexation. The Stage-2 impact encoder must not
+// move borders, so strip the two things it might still emit that would collide
+// with the adjudicator: a whole regionTransfers list (dropped outright), and the
+// status/absorbedBy of any polityChange (a rename/recolor is still fine, but a
+// stale prompt pack must not be able to annex a polity behind the adjudicator's
+// back). Purely defensive — the current jumpImpacts prompt no longer asks for
+// either, but a scenario-bundled pack could.
+const stripEncoderTerritory = (polityChange) => {
+  if (!polityChange || typeof polityChange !== "object" || Array.isArray(polityChange)) {
+    return polityChange;
+  }
+  const { status, absorbedBy, ...rest } = polityChange;
+  return rest;
+};
+
 // Coerce one Stage 2 batch reply into clean impact entries. eventIndex is the
 // GLOBAL index the model was shown; anything outside [batchStart, batchStart+
 // batchLength) is junk from a confused model and is dropped, as is a duplicate
 // index (first entry wins). An empty result is perfectly valid — a calm batch
-// legitimately produces no impacts.
+// legitimately produces no impacts. regionTransfers are always emptied and
+// polityChanges are stripped of status/absorbedBy (see stripEncoderTerritory).
 export const normalizeImpactsPayload = (parsed, batchStart = 0, batchLength = Infinity) => {
   const start = toInt(batchStart) ?? 0;
   const length = Number.isFinite(batchLength) ? Math.max(0, Math.trunc(batchLength)) : Infinity;
@@ -88,8 +105,9 @@ export const normalizeImpactsPayload = (parsed, batchStart = 0, batchLength = In
     seen.add(idx);
     out.push({
       eventIndex: idx,
-      regionTransfers: asArray(entry.regionTransfers),
-      polityChanges: asArray(entry.polityChanges),
+      // Territory belongs to the adjudicator now — never trust encoder transfers.
+      regionTransfers: [],
+      polityChanges: asArray(entry.polityChanges).map(stripEncoderTerritory),
       ledgerChanges: asArray(entry.ledgerChanges),
       unitOps: asArray(entry.unitOps),
       createdChats: asArray(entry.createdChats),
@@ -129,16 +147,17 @@ export const mergeImpactsByIndex = (events, impactEntries) => {
 };
 
 // ---------------------------------------------------------------------------
-// Region-vocabulary grounding + resolver-feedback repair (Stage 2 support).
+// Territorial adjudicator support (WP7): a closed-menu region-ownership pass.
 //
 // The Stage-1 narrative names places with era-appropriate or poetic labels
 // ("the Thracesian theme", "Philadelphia") while the map catalog carries modern
-// GADM admin names ("Aydın", "Denizli"). Stage 2 therefore emits regionTransfers
-// the resolver can't match, and every sub-national conquest silently drops. The
-// helpers below (all pure, no .jsx) (a) build the real region vocabulary shown to
-// the encoder and (b) drive a one-shot repair call over whatever still fails to
-// resolve. Anything needing loadRegionCatalog/loadCountryNames lives in
-// gameplay.js and delegates here.
+// GADM admin names ("Aydın", "Denizli"). Instead of asking a model to WRITE
+// region names (the fragile string-resolver chain the user rejected), a per-turn
+// adjudicator PICKS from a numbered menu of the regions each relevant polity
+// actually holds. These helpers (all pure, no .jsx) build that menu and resolve
+// the adjudicator's menu-key picks into already-catalog-true transfers. Anything
+// needing loadRegionCatalog/loadCountryNames lives in gameplay.js and delegates
+// here.
 // ---------------------------------------------------------------------------
 
 const trimStr = (value) => String(value ?? "").trim();
@@ -147,7 +166,7 @@ const escapeRegExp = (value) => trimStr(value).replace(/[.*+?^${}()|[\]\\]/g, "\
 
 // A region's CURRENT owner — the live override when present, else the stock
 // map's country code. Mirrors regionTransferResolver.js's currentOwner so the
-// vocabulary and candidate lists agree with what the resolver will actually do.
+// menu agrees with what the apply-time resolver will actually do.
 export const regionOwnerCode = (region, ownership = {}) =>
   trimStr(ownership?.[region?.id] ?? region?.countryCode ?? "");
 
@@ -180,7 +199,7 @@ export const sharesNameToken = (a, b, minLen = 4) => {
   return false;
 };
 
-// Which polities does a batch's prose mention? Scans text for each entry's
+// Which polities does the turn's prose mention? Scans text for each entry's
 // display name / alias (case-insensitive substring, length ≥ 3) or its code
 // (whole-word, case-insensitive). Returns codes in catalog order, deduped.
 // polityEntries: [{ code, name, aliases? }].
@@ -219,9 +238,9 @@ export const detectPolityCodes = (text, polityEntries) => {
   return out;
 };
 
-// Decide which polities' region vocabulary a batch needs: ALWAYS the player,
-// then every polity the batch mentions. If that yields fewer than minPolities,
-// top up from fallbackCodes (catalog order). Capped at maxPolities.
+// Decide which polities' region menu the turn needs: ALWAYS the player, then
+// every polity the prose mentions. If that yields fewer than minPolities, top up
+// from fallbackCodes (catalog order). Capped at maxPolities.
 export const selectBatchPolities = ({
   batchText = "",
   polityEntries = [],
@@ -249,27 +268,13 @@ export const selectBatchPolities = ({
   return ordered.slice(0, maxPolities);
 };
 
-// One polity's held-region list for the Stage-2 vocabulary block. Caps the list
-// and reports the overflow count so the encoder knows more regions resolve too.
-export const formatPolityRegionVocabulary = ({ code, name, regions, cap = 50 } = {}) => {
-  const list = asArray(regions).filter((region) => region?.id);
-  const label = trimStr(name) ? `${trimStr(name)} (${trimStr(code)})` : trimStr(code);
-  const header = `REGIONS HELD BY ${label} — partial transfers MUST name regions from this list exactly:`;
-  if (list.length === 0) {
-    return `${header}\n  (no regions currently attributed to this polity on the map)`;
-  }
-  const shown = list.slice(0, cap);
-  const lines = shown.map((region) => `- ${region.name || region.id} [${region.id}]`);
-  const remaining = list.length - shown.length;
-  if (remaining > 0) {
-    lines.push(`…and ${remaining} more (any of this polity's other regions also resolve by exact name)`);
-  }
-  return `${header}\n${lines.join("\n")}`;
-};
-
-// Full Stage-2 vocabulary block: one formatPolityRegionVocabulary section per
-// polity code. nameByCode maps an upper-cased code to its display name.
-export const buildRegionVocabularyBlock = ({
+// Build the closed REGION MENU the adjudicator picks from. For each polity code,
+// its currently-held regions are listed as GLOBALLY-numbered `R<N>` entries
+// (unique across the whole menu). Returns { text, byKey } where byKey resolves a
+// menu key `R<N>` (upper-cased) AND each listed region's exact id (upper-cased)
+// to { regionId, ownerCode }. Caps regionCap regions per polity with an overflow
+// note so the model knows the polity's other regions are also fair game.
+export const buildRegionMenu = ({
   polityCodes = [],
   regions = [],
   ownership = {},
@@ -277,95 +282,189 @@ export const buildRegionVocabularyBlock = ({
   regionCap = 50,
 } = {}) => {
   const names = nameByCode instanceof Map ? nameByCode : new Map(Object.entries(nameByCode ?? {}));
-  const blocks = asArray(polityCodes).map((code) =>
-    formatPolityRegionVocabulary({
-      code,
-      name: names.get(trimStr(code).toUpperCase()) || code,
-      regions: holdingsForCode(regions, ownership, code),
-      cap: regionCap,
-    }),
-  );
-  return blocks.join("\n\n");
+  const nameOf = (code) => names.get(trimStr(code).toUpperCase()) || trimStr(code);
+  const byKey = new Map();
+  const sections = [];
+  let counter = 0;
+
+  for (const rawCode of asArray(polityCodes)) {
+    const code = trimStr(rawCode);
+    if (!code) continue;
+    const label = nameOf(code) ? `${nameOf(code)} (${code})` : code;
+    const held = holdingsForCode(regions, ownership, code);
+    if (held.length === 0) {
+      sections.push(`${label} — holds no regions on the current map.`);
+      continue;
+    }
+    const shown = held.slice(0, regionCap);
+    const lines = [];
+    for (const region of shown) {
+      counter += 1;
+      const key = `R${counter}`;
+      const ownerCode = regionOwnerCode(region, ownership);
+      const record = { regionId: region.id, ownerCode };
+      byKey.set(key.toUpperCase(), record);
+      byKey.set(trimStr(region.id).toUpperCase(), record);
+      lines.push(`${key}: ${region.name || region.id} [${region.id}] — held by ${label}`);
+    }
+    const remaining = held.length - shown.length;
+    if (remaining > 0) {
+      lines.push(`…and ${remaining} more region(s) held by ${label} not listed here.`);
+    }
+    sections.push(`${label} holds:\n${lines.join("\n")}`);
+  }
+
+  return { text: sections.join("\n\n"), byKey };
 };
 
-// Candidate regions for repairing ONE unresolved transfer: the fromCode
-// polity's current holdings (cap holdingsCap) PLUS catalog regions whose name
-// shares a whole-word token with the requested regionName (cap tokenCap).
-// Deduped by id; returns compact {id, name, country, countryCode} rows.
-export const buildRepairCandidates = (
-  entry,
-  { regions = [], ownership = {}, holdingsCap = 50, tokenCap = 20, minTokenLen = 4 } = {},
-) => {
-  const out = [];
-  const seen = new Set();
-  const add = (region) => {
-    if (!region?.id || seen.has(region.id)) return;
-    seen.add(region.id);
-    out.push({
-      id: region.id,
-      name: region.name || "",
-      country: region.country || "",
-      countryCode: region.countryCode || "",
-    });
+// Resolve the adjudicator's parsed reply against the menu. `region` accepts a
+// menu key (R<N>, case-insensitive) or an exact region id present in byKey;
+// unknown keys are dropped. toCode/absorbedBy must be in validCodes (case-
+// normalized to the catalog's canonical casing). An out-of-range eventIndex is
+// re-attached to the LAST event rather than dropped — a real conquest should not
+// vanish over an index slip. Region ids are deduped (first pick wins).
+export const resolveAdjudication = (parsed, { byKey, eventCount, validCodes } = {}) => {
+  const keys = byKey instanceof Map ? byKey : new Map(Object.entries(byKey ?? {}));
+  const codeCanon = new Map();
+  for (const raw of asArray(validCodes)) {
+    const code = trimStr(raw);
+    if (code) codeCanon.set(code.toUpperCase(), code);
+  }
+  const validCode = (value) => codeCanon.get(trimStr(value).toUpperCase()) || "";
+
+  const count = Number.isFinite(eventCount) ? Math.max(0, Math.trunc(eventCount)) : 0;
+  const lastIndex = count > 0 ? count - 1 : 0;
+  const clampIndex = (raw) => {
+    const idx = toInt(raw);
+    if (idx === null || idx < 0 || idx >= count) return lastIndex;
+    return idx;
   };
 
-  const fromCode = trimStr(entry?.fromCode);
-  if (fromCode) {
-    for (const region of holdingsForCode(regions, ownership, fromCode).slice(0, holdingsCap)) add(region);
-  }
+  const source = parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  const transfers = [];
+  const annexations = [];
+  const seenRegion = new Set();
+  const seenAnnex = new Set();
+  let dropped = 0;
 
-  const requested = trimStr(entry?.regionName) || trimStr(entry?.regionId);
-  if (requested) {
-    let added = 0;
-    for (const region of asArray(regions)) {
-      if (added >= tokenCap) break;
-      if (!region?.id || seen.has(region.id)) continue;
-      if (sharesNameToken(requested, region.name, minTokenLen)) {
-        add(region);
-        added += 1;
-      }
+  for (const entry of asArray(source.transfers)) {
+    if (!entry || typeof entry !== "object") {
+      dropped += 1;
+      continue;
     }
+    const lookup = keys.get(trimStr(entry.region).toUpperCase());
+    const toCode = validCode(entry.toCode);
+    if (!lookup || !toCode) {
+      dropped += 1;
+      continue;
+    }
+    if (seenRegion.has(lookup.regionId)) {
+      dropped += 1;
+      continue;
+    }
+    seenRegion.add(lookup.regionId);
+    transfers.push({
+      eventIndex: clampIndex(entry.eventIndex),
+      regionId: lookup.regionId,
+      fromCode: lookup.ownerCode,
+      toCode,
+    });
   }
-  return out;
+
+  for (const entry of asArray(source.annexations)) {
+    if (!entry || typeof entry !== "object") {
+      dropped += 1;
+      continue;
+    }
+    const code = validCode(entry.code);
+    const absorbedBy = validCode(entry.absorbedBy);
+    if (!code || !absorbedBy) {
+      dropped += 1;
+      continue;
+    }
+    const key = code.toUpperCase();
+    if (seenAnnex.has(key)) {
+      dropped += 1;
+      continue;
+    }
+    seenAnnex.add(key);
+    annexations.push({ eventIndex: clampIndex(entry.eventIndex), code, absorbedBy });
+  }
+
+  return { transfers, annexations, dropped };
 };
 
-// eventIndex -> regionTransfers[] from an array of impact-ish entries.
-const indexTransfers = (entries) => {
-  const map = new Map();
-  for (const entry of asArray(entries)) {
-    const idx = toInt(entry?.eventIndex);
-    if (idx === null) continue;
-    if (!map.has(idx)) map.set(idx, asArray(entry.regionTransfers));
-  }
-  return map;
+// Expand a whole-polity annexation into per-region transfers: every region the
+// losing polity currently holds (currentOwner = override ?? countryCode) moves
+// to absorbedBy, plus a polityChanges entry flipping the loser to "annexed".
+export const expandAnnexation = (code, { regions = [], ownership = {}, absorbedBy = "" } = {}) => {
+  const victor = trimStr(absorbedBy);
+  const loser = trimStr(code);
+  const transfers = holdingsForCode(regions, ownership, loser).map((region) => ({
+    regionId: region.id,
+    regionName: region.name || "",
+    fromCode: regionOwnerCode(region, ownership),
+    toCode: victor,
+  }));
+  const polityChanges = [{ code: loser, status: "annexed", absorbedBy: victor }];
+  return { transfers, polityChanges };
 };
 
-const asIndexMap = (value) => {
-  if (value instanceof Map) return value;
-  if (Array.isArray(value)) return indexTransfers(value);
-  const map = new Map();
-  for (const [key, val] of Object.entries(value ?? {})) {
-    const idx = toInt(key);
-    if (idx !== null) map.set(idx, asArray(val));
-  }
-  return map;
-};
+// Merge a resolved adjudication into the Stage-1 events by eventIndex. Transfers
+// append to that event's impacts.regionTransfers as ALREADY-RESOLVED entries
+// (real catalog id + name); annexation events additionally get the expanded
+// transfers and the "annexed" polityChanges entry. Existing impacts (Stage-2
+// ledger/unit/chat) are preserved. Ownership is the pre-turn snapshot — the
+// apply-time resolver re-threads it event-by-event and skips already-owned land.
+export const mergeAdjudicationIntoEvents = (events, resolution, { regions = [], ownership = {} } = {}) => {
+  const list = asArray(events);
+  if (list.length === 0) return list;
 
-// Fold a repair reply back into a batch's impact entries. For every eventIndex
-// the repair reply covers, that event's regionTransfers become its originally
-// RESOLVED transfers (resolvedByIndex) PLUS the corrected repair transfers — the
-// unresolved originals are dropped. Events the repair reply does NOT mention are
-// returned unchanged (their originals survive to the final resolver pass).
-//   - originalEntries: the batch's normalized impact entries
-//   - resolvedByIndex: Map/obj/array — eventIndex -> transfers that resolved
-//   - repairEntries: the parsed repair reply (array of {eventIndex, regionTransfers})
-export const mergeRepairedTransfers = (originalEntries, resolvedByIndex, repairEntries) => {
-  const resolved = asIndexMap(resolvedByIndex);
-  const repaired = asIndexMap(repairEntries);
-  return asArray(originalEntries).map((entry) => {
-    const idx = toInt(entry?.eventIndex);
-    if (idx === null || !repaired.has(idx)) return entry;
-    const kept = resolved.has(idx) ? asArray(resolved.get(idx)) : [];
-    return { ...entry, regionTransfers: [...kept, ...asArray(repaired.get(idx))] };
+  const nameById = new Map(asArray(regions).map((region) => [trimStr(region?.id), region?.name || ""]));
+  const additions = new Map(); // idx -> { regionTransfers:[], polityChanges:[] }
+  const bucket = (idx) => {
+    if (!additions.has(idx)) additions.set(idx, { regionTransfers: [], polityChanges: [] });
+    return additions.get(idx);
+  };
+
+  const { transfers = [], annexations = [] } =
+    resolution && typeof resolution === "object" ? resolution : {};
+
+  for (const transfer of asArray(transfers)) {
+    const idx = toInt(transfer?.eventIndex);
+    if (idx === null || idx < 0 || idx >= list.length) continue;
+    bucket(idx).regionTransfers.push({
+      regionId: transfer.regionId,
+      regionName: nameById.get(trimStr(transfer.regionId)) || "",
+      fromCode: transfer.fromCode || "",
+      toCode: transfer.toCode || "",
+    });
+  }
+
+  for (const annex of asArray(annexations)) {
+    const idx = toInt(annex?.eventIndex);
+    if (idx === null || idx < 0 || idx >= list.length) continue;
+    const { transfers: annexTransfers, polityChanges } = expandAnnexation(annex.code, {
+      regions,
+      ownership,
+      absorbedBy: annex.absorbedBy,
+    });
+    const b = bucket(idx);
+    for (const t of annexTransfers) b.regionTransfers.push(t);
+    for (const change of polityChanges) b.polityChanges.push(change);
+  }
+
+  return list.map((event, index) => {
+    const add = additions.get(index);
+    if (!add) return event;
+    const baseImpacts = event.impacts && typeof event.impacts === "object" ? event.impacts : {};
+    return {
+      ...event,
+      impacts: {
+        ...baseImpacts,
+        regionTransfers: [...asArray(baseImpacts.regionTransfers), ...add.regionTransfers],
+        polityChanges: [...asArray(baseImpacts.polityChanges), ...add.polityChanges],
+      },
+    };
   });
 };

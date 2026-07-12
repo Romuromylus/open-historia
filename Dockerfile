@@ -34,6 +34,8 @@ RUN node scripts/resolve-lfs.mjs . "$LFS_OWNER" "$LFS_REPO" "$GIT_SHA" \
 
 # Build the client bundle. The pmtiles vite copies into dist/assets are dead
 # weight — the client streams them from public/assets through the server API.
+# Export the build SHA into the env so vite.config.ts can stamp it into the bundle.
+ENV GIT_SHA=$GIT_SHA
 RUN npm run build \
   && rm -f dist/assets/*.pmtiles
 

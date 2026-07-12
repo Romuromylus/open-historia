@@ -5,6 +5,12 @@ import App from "./App.jsx";
 import "maplibre-gl/dist/maplibre-gl.css";
 import "./styles.css";
 
+// Build stamp for deploy diagnosis (the 7-char Git SHA, or "dev" locally).
+// Guarded so tests/node without the vite define don't throw.
+if (typeof __PAX_BUILD__ !== "undefined") {
+  console.info(`[pax] build ${__PAX_BUILD__}`);
+}
+
 configureMapRuntime();
 
 createRoot(document.getElementById("root")).render(

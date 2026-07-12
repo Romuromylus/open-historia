@@ -41,9 +41,13 @@ import { resolveExpansion } from "../../runtime/expansion.js";
 import { planAiTurn } from "../../runtime/aiTurn.js";
 import { resolveRegionTransfers } from "../../runtime/regionTransferResolver.js";
 import {
+  buildRegionVocabularyBlock,
+  buildRepairCandidates,
   chunkEvents,
   mergeImpactsByIndex,
+  mergeRepairedTransfers,
   normalizeImpactsPayload,
+  selectBatchPolities,
   validateNarrativePayload,
 } from "./turnPipeline.js";
 
@@ -1764,7 +1768,25 @@ const buildPolityCodeList = async (world) => {
 // machine context (territory with region ids + polity code list) in the user
 // message, pack-proof, alongside the batch's globally-numbered events. Impacts
 // are keyed back to the whole-turn list by the eventIndex shown here.
-const buildImpactsUserMessage = ({ batch, batchStart, territoryOverridesText, polityCodeList }) => {
+// Rides the user message alongside the region/ledger/conquest contracts. Forces
+// the encoder to actually emit transfers for narrated territory changes and to
+// spend the real region vocabulary block below instead of inventing archaic or
+// poetic place names the resolver can't match.
+const REGION_GROUNDING_INSTRUCTION =
+  "When an event describes an army taking, seizing, occupying, liberating, or losing territory, you MUST emit the " +
+  "matching impacts.regionTransfers — a narrated conquest with no transfer is an error. For a PARTIAL conquest, each " +
+  "regionName MUST be copied EXACTLY from the REGIONS HELD BY … lists below (or be an exact region id from them); if the " +
+  "narrated place name is archaic, poetic, or a historical exonym, pick the listed region(s) that geographically " +
+  "correspond to it. For a TOTAL conquest of a nation, use that polity's display name as regionName (the resolver " +
+  "expands it to every region it holds), as described above.";
+
+const buildImpactsUserMessage = ({
+  batch,
+  batchStart,
+  territoryOverridesText,
+  polityCodeList,
+  regionVocabularyText = "",
+}) => {
   const numbered = batch
     .map((event, offset) => {
       const idx = batchStart + offset;
@@ -1782,9 +1804,68 @@ const buildImpactsUserMessage = ({ batch, batchStart, territoryOverridesText, po
     "batch. Do not invent events or restate their text.\n\n" +
     `EVENTS TO ENCODE:\n${numbered}\n\n` +
     `${REGION_TRANSFER_CONTRACT} ${LEDGER_CONTRACT} ${CONQUEST_CONTRACT}\n\n` +
+    `${REGION_GROUNDING_INSTRUCTION}\n\n` +
+    (regionVocabularyText
+      ? `REGION VOCABULARY (use these exact region names/ids for partial transfers):\n${regionVocabularyText}\n\n`
+      : "") +
     `CURRENT TERRITORY OVERRIDES (region name [region id] -> owner code):\n${territoryOverridesText}\n\n` +
     `POLITY CODES (machine code = display name):\n${polityCodeList}`
   );
+};
+
+// Repair user message: shown after a batch's transfers are dry-run through the
+// resolver and some fail to match. Carries the batch's own events, the failing
+// transfers verbatim, and a tight candidate-region set per failure so the model
+// can re-pick a real region name/id (or a polity display name for a total win).
+const buildImpactsRepairMessage = ({ numberedEvents, unresolvedByIndex, candidatesByKey }) => {
+  const unresolvedBlocks = [];
+  const candidateBlocks = [];
+  for (const [eventIndex, entries] of unresolvedByIndex) {
+    unresolvedBlocks.push(`Event ${eventIndex}:\n${JSON.stringify(entries, null, 2)}`);
+    entries.forEach((entry, offset) => {
+      const requested = normalizeString(entry?.regionName) || normalizeString(entry?.regionId) || "(unnamed)";
+      const candidates = candidatesByKey.get(`${eventIndex}:${offset}`) ?? [];
+      const lines = candidates.length
+        ? candidates.map((region) => `- ${region.name || region.id} [${region.id}]${region.country ? ` (${region.country})` : ""}`).join("\n")
+        : "- (no close candidates — drop this transfer if nothing corresponds)";
+      candidateBlocks.push(`Event ${eventIndex}, requested "${requested}" -> ${normalizeString(entry?.toCode) || "?"}:\n${lines}`);
+    });
+  }
+
+  return (
+    "Some regionTransfers you emitted below could not be matched to any real map region, so the territory did not " +
+    "move. Re-emit ONLY the corrected regionTransfers for the listed events. Choose each regionName/regionId EXACTLY " +
+    "from that entry's CANDIDATE REGIONS (or use a polity's display name as regionName for a total conquest). Drop any " +
+    "transfer that genuinely has no correspondence. Return JSON only in the shape " +
+    '{"impacts":[{"eventIndex":N,"regionTransfers":[...]}]}.\n\n' +
+    `EVENTS:\n${numberedEvents}\n\n` +
+    `UNRESOLVED TRANSFERS (verbatim):\n${unresolvedBlocks.join("\n\n")}\n\n` +
+    `CANDIDATE REGIONS:\n${candidateBlocks.join("\n\n")}`
+  );
+};
+
+// Code-keyed polity entries ({ code, name, aliases }) for per-batch mention
+// detection: the stock country catalog merged with scenario polity overrides
+// (which carry the AI-written aliases the narrative is likely to use).
+const buildPolityMatchEntries = async (world) => {
+  const catalog = mergePolityCatalog(await loadCountryNames().catch(() => []), world);
+  const byCode = new Map();
+  for (const entry of catalog) {
+    const code = entry.code || entry.name;
+    if (!code) continue;
+    const key = code.toUpperCase();
+    if (!byCode.has(key)) byCode.set(key, { aliases: [], code, name: entry.name || code });
+  }
+  for (const polity of Object.values(normalizeWorldState(world).polityOverrides)) {
+    if (!polity?.code) continue;
+    const key = polity.code.toUpperCase();
+    const existing = byCode.get(key) || { aliases: [], code: polity.code, name: polity.name || polity.code };
+    if (polity.name && !existing.name) existing.name = polity.name;
+    const aliases = new Set([...existing.aliases, ...normalizeArray(polity.aliases).filter(Boolean)]);
+    existing.aliases = Array.from(aliases);
+    byCode.set(key, existing);
+  }
+  return Array.from(byCode.values());
 };
 
 // Pax Colonia's turn simulation, reworked into a FAIL-HARD two-stage pipeline.
@@ -1873,14 +1954,131 @@ export const simulateTimelineJump = async ({ days, mode = "jump", onProgress } =
   // ---- Stage 2: impacts per event, in parallel batches. Each batch: 2 tries. ----
   const territoryOverridesText = await buildTerritorySummary(bundle.world);
   const polityCodeList = await buildPolityCodeList(bundle.world);
+  // Region-vocabulary + repair context, loaded once and shared across batches.
+  const stage2World = normalizeWorldState(bundle.world);
+  const stage2Ownership = stage2World.regionOwnershipOverrides;
+  const stage2PolityOverrides = stage2World.polityOverrides;
+  const regionCatalog = await loadRegionCatalog().catch(() => []);
+  const polityEntries = await buildPolityMatchEntries(bundle.world);
+  const fallbackPolityCodes = polityEntries.map((entry) => entry.code).filter(Boolean);
+  const polityNameByCode = new Map(polityEntries.map((entry) => [entry.code.toUpperCase(), entry.name]));
+  const playerCode = normalizeString(bundle.game.country);
   const batches = chunkEvents(events, IMPACT_BATCH_SIZE);
   const totalBatches = batches.length;
   let batchesDone = 0;
   report(`Resolving consequences… (batch 0/${totalBatches})`);
 
+  const numberBatchEvents = (batch, batchStart) =>
+    batch
+      .map((event, offset) => {
+        const idx = batchStart + offset;
+        const date = normalizeString(event?.date) || "undated";
+        const title = normalizeString(event?.title);
+        const description = normalizeString(event?.description);
+        return `Event ${idx}: [${date}] ${title}${description ? `\n  ${description}` : ""}`;
+      })
+      .join("\n\n");
+
+  // Which polities' real region names does THIS batch need? Detected from the
+  // batch prose, plus the player, then formatted into the vocabulary block.
+  const batchRegionVocabulary = (batch) => {
+    if (regionCatalog.length === 0) return "";
+    const batchText = batch
+      .map((event) => `${normalizeString(event?.title)} ${normalizeString(event?.description)}`)
+      .join("\n");
+    const batchPolities = selectBatchPolities({
+      batchText,
+      polityEntries,
+      playerCode,
+      fallbackCodes: fallbackPolityCodes,
+    });
+    return buildRegionVocabularyBlock({
+      polityCodes: batchPolities,
+      regions: regionCatalog,
+      ownership: stage2Ownership,
+      nameByCode: polityNameByCode,
+      regionCap: 50,
+    });
+  };
+
+  // Resolver-feedback repair: after a batch parses, dry-run its transfers over a
+  // throwaway ownership copy; if any fail to resolve, make ONE repair call with
+  // per-failure candidate regions, then splice the corrections back in. Any
+  // failure keeps the originals (the final apply-time resolver still drops the
+  // truly unresolvable ones), so repair is best-effort and never fails the turn.
+  const repairBatchTransfers = async ({ batch, batchStart, entries }) => {
+    if (regionCatalog.length === 0) return entries;
+
+    const flat = [];
+    for (const entry of entries) {
+      for (const transfer of normalizeArray(entry.regionTransfers)) {
+        flat.push({ eventIndex: entry.eventIndex, transfer });
+      }
+    }
+    if (flat.length === 0) return entries;
+
+    const { unresolved } = resolveRegionTransfers(
+      flat.map((item) => item.transfer),
+      { ownership: { ...stage2Ownership }, polityOverrides: stage2PolityOverrides, regions: regionCatalog },
+    );
+    if (unresolved.length === 0) return entries;
+
+    // Reference identity ties each unresolved raw entry back to its event.
+    const unresolvedSet = new Set(unresolved);
+    const resolvedByIndex = new Map();
+    const unresolvedByIndex = new Map();
+    const candidatesByKey = new Map();
+    for (const { eventIndex, transfer } of flat) {
+      if (unresolvedSet.has(transfer)) {
+        if (!unresolvedByIndex.has(eventIndex)) unresolvedByIndex.set(eventIndex, []);
+        const offset = unresolvedByIndex.get(eventIndex).length;
+        unresolvedByIndex.get(eventIndex).push(transfer);
+        candidatesByKey.set(
+          `${eventIndex}:${offset}`,
+          buildRepairCandidates(transfer, { ownership: stage2Ownership, regions: regionCatalog }),
+        );
+      } else {
+        if (!resolvedByIndex.has(eventIndex)) resolvedByIndex.set(eventIndex, []);
+        resolvedByIndex.get(eventIndex).push(transfer);
+      }
+    }
+
+    report("Refining territorial changes…");
+    try {
+      const parsed = await runJsonTask("jumpImpacts", {
+        timeoutMs: 120000,
+        userMessage: buildImpactsRepairMessage({
+          numberedEvents: numberBatchEvents(batch, batchStart),
+          unresolvedByIndex,
+          candidatesByKey,
+        }),
+        variables,
+      });
+      const repairEntries = normalizeImpactsPayload(parsed, batchStart, batch.length).filter((entry) =>
+        unresolvedByIndex.has(entry.eventIndex),
+      );
+      if (repairEntries.length === 0) {
+        console.warn(`[ai] region-transfer repair @${batchStart}: no usable corrections; keeping originals.`);
+        return entries;
+      }
+      return mergeRepairedTransfers(entries, resolvedByIndex, repairEntries);
+    } catch (error) {
+      console.warn(
+        `[ai] region-transfer repair @${batchStart} failed (${error?.message || error}); keeping originals.`,
+      );
+      return entries;
+    }
+  };
+
   const runBatch = async (batch, batchIndex) => {
     const batchStart = batchIndex * IMPACT_BATCH_SIZE;
-    const userMessage = buildImpactsUserMessage({ batch, batchStart, territoryOverridesText, polityCodeList });
+    const userMessage = buildImpactsUserMessage({
+      batch,
+      batchStart,
+      territoryOverridesText,
+      polityCodeList,
+      regionVocabularyText: batchRegionVocabulary(batch),
+    });
 
     let entries = null;
     let reason = "";
@@ -1908,6 +2106,7 @@ export const simulateTimelineJump = async ({ days, mode = "jump", onProgress } =
           "Nothing was changed — try the jump again.",
       );
     }
+    entries = await repairBatchTransfers({ batch, batchStart, entries });
     batchesDone += 1;
     report(`Resolving consequences… (batch ${batchesDone}/${totalBatches})`);
     return entries;

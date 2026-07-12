@@ -2,11 +2,40 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
 import {
+  buildRegionVocabularyBlock,
+  buildRepairCandidates,
   chunkEvents,
+  detectPolityCodes,
+  formatPolityRegionVocabulary,
+  holdingsForCode,
   mergeImpactsByIndex,
+  mergeRepairedTransfers,
+  nameTokens,
   normalizeImpactsPayload,
+  regionOwnerCode,
+  selectBatchPolities,
+  sharesNameToken,
   validateNarrativePayload,
 } from "./turnPipeline.js";
+
+// A small stand-in region catalog: Byzantine-held Aegean regions (owned via
+// override), one Bulgaria region held via the stock countryCode, and a decoy
+// that shares a token with an archaic name.
+const REGIONS = [
+  { id: "TUR.8_1", name: "Aydın", country: "Turkey", countryCode: "TUR" },
+  { id: "TUR.20_1", name: "Denizli", country: "Turkey", countryCode: "TUR" },
+  { id: "TUR.33_1", name: "Manisa", country: "Turkey", countryCode: "TUR" },
+  { id: "GRC.1_1", name: "Philadelphia Plain", country: "Greece", countryCode: "GRC" },
+  { id: "BGR.5_1", name: "Plovdiv", country: "Bulgaria", countryCode: "BGR" },
+];
+// Byzantines (BYZ) hold the three Anatolian regions + the Greek plain via
+// override; Plovdiv is Bulgaria's by its stock countryCode.
+const OWNERSHIP = { "TUR.8_1": "BYZ", "TUR.20_1": "BYZ", "TUR.33_1": "BYZ", "GRC.1_1": "BYZ" };
+const POLITIES = [
+  { code: "BYZ", name: "Byzantine Empire", aliases: ["Rhomania", "the Romans"] },
+  { code: "BGR", name: "Bulgaria", aliases: [] },
+  { code: "SRB", name: "Serbia", aliases: [] },
+];
 
 const makeEvents = (n) =>
   Array.from({ length: n }, (_, i) => ({ title: `Event ${i}`, description: `d${i}`, date: "1500-01-01" }));
@@ -171,5 +200,186 @@ describe("mergeImpactsByIndex", () => {
     for (const event of merged) {
       assert.deepEqual(event.impacts.regionTransfers, []);
     }
+  });
+});
+
+describe("regionOwnerCode / holdingsForCode", () => {
+  it("reads the live override first, then the stock countryCode", () => {
+    assert.equal(regionOwnerCode(REGIONS[0], OWNERSHIP), "BYZ"); // overridden
+    assert.equal(regionOwnerCode(REGIONS[4], OWNERSHIP), "BGR"); // stock code
+    assert.equal(regionOwnerCode({ id: "X" }, {}), ""); // nothing known
+  });
+
+  it("lists every region a polity currently holds (override or stock)", () => {
+    const byz = holdingsForCode(REGIONS, OWNERSHIP, "byz").map((r) => r.id);
+    assert.deepEqual(byz.sort(), ["GRC.1_1", "TUR.20_1", "TUR.33_1", "TUR.8_1"]);
+    assert.deepEqual(holdingsForCode(REGIONS, OWNERSHIP, "BGR").map((r) => r.id), ["BGR.5_1"]);
+    assert.deepEqual(holdingsForCode(REGIONS, OWNERSHIP, ""), []);
+  });
+});
+
+describe("nameTokens / sharesNameToken", () => {
+  it("keeps only whole-word tokens of the minimum length", () => {
+    assert.deepEqual([...nameTokens("Philadelphia Plain")].sort(), ["philadelphia", "plain"]);
+    assert.equal(nameTokens("Aydın").has("aydın"), true);
+    assert.equal(nameTokens("of the by").size, 0); // all shorter than 4
+  });
+
+  it("bridges an archaic name to a catalog name via a shared token", () => {
+    assert.equal(sharesNameToken("the Philadelphia theme", "Philadelphia Plain"), true);
+    assert.equal(sharesNameToken("Denizli sanjak", "Denizli"), true);
+    assert.equal(sharesNameToken("Manisa", "Aydın"), false);
+  });
+});
+
+describe("detectPolityCodes", () => {
+  it("matches display names, aliases, and whole-word codes", () => {
+    assert.deepEqual(detectPolityCodes("The Byzantine Empire marched east", POLITIES), ["BYZ"]);
+    assert.deepEqual(detectPolityCodes("Rhomania mustered its themes", POLITIES), ["BYZ"]);
+    assert.deepEqual(detectPolityCodes("BGR sued for peace", POLITIES), ["BGR"]);
+  });
+
+  it("returns codes in catalog order, deduped, and ignores empty text", () => {
+    assert.deepEqual(
+      detectPolityCodes("Bulgaria and the Byzantine Empire and Bulgaria again", POLITIES),
+      ["BYZ", "BGR"],
+    );
+    assert.deepEqual(detectPolityCodes("", POLITIES), []);
+  });
+
+  it("does not match a code buried inside a longer word", () => {
+    // "SRB" must not fire on "disturbing"; no polity is mentioned here.
+    assert.deepEqual(detectPolityCodes("a disturbing calm settled over the coast", POLITIES), []);
+  });
+});
+
+describe("selectBatchPolities", () => {
+  it("always includes the player, then every mentioned polity", () => {
+    const codes = selectBatchPolities({
+      batchText: "Bulgaria raided the frontier",
+      polityEntries: POLITIES,
+      playerCode: "BYZ",
+    });
+    assert.equal(codes[0], "BYZ"); // player first
+    assert.ok(codes.includes("BGR"));
+  });
+
+  it("tops up from fallback codes when too few are detected", () => {
+    const codes = selectBatchPolities({
+      batchText: "a quiet season passed with no war",
+      polityEntries: POLITIES,
+      playerCode: "BYZ",
+      fallbackCodes: ["BGR", "SRB"],
+      minPolities: 2,
+    });
+    assert.ok(codes.length >= 2);
+    assert.equal(codes[0], "BYZ");
+  });
+
+  it("caps the number of polities", () => {
+    const codes = selectBatchPolities({
+      batchText: "",
+      polityEntries: POLITIES,
+      playerCode: "BYZ",
+      fallbackCodes: ["A", "B", "C", "D", "E", "F", "G", "H"],
+      maxPolities: 6,
+    });
+    assert.equal(codes.length, 6);
+  });
+});
+
+describe("formatPolityRegionVocabulary / buildRegionVocabularyBlock", () => {
+  it("lists held regions with exact names and ids under a partial-transfer header", () => {
+    const text = formatPolityRegionVocabulary({
+      code: "BYZ",
+      name: "Byzantine Empire",
+      regions: holdingsForCode(REGIONS, OWNERSHIP, "BYZ"),
+    });
+    assert.match(text, /REGIONS HELD BY Byzantine Empire \(BYZ\)/);
+    assert.match(text, /- Aydın \[TUR\.8_1\]/);
+    assert.match(text, /MUST name regions from this list exactly/);
+  });
+
+  it("caps the list and reports the overflow count", () => {
+    const many = Array.from({ length: 55 }, (_, i) => ({ id: `R${i}`, name: `Region ${i}` }));
+    const text = formatPolityRegionVocabulary({ code: "BYZ", name: "Byz", regions: many, cap: 50 });
+    assert.match(text, /…and 5 more/);
+  });
+
+  it("notes when a polity holds no attributed regions", () => {
+    const text = formatPolityRegionVocabulary({ code: "SRB", name: "Serbia", regions: [] });
+    assert.match(text, /no regions currently attributed/);
+  });
+
+  it("builds one section per polity code with names from nameByCode", () => {
+    const block = buildRegionVocabularyBlock({
+      polityCodes: ["BYZ", "BGR"],
+      regions: REGIONS,
+      ownership: OWNERSHIP,
+      nameByCode: new Map([["BYZ", "Byzantine Empire"], ["BGR", "Bulgaria"]]),
+    });
+    assert.match(block, /REGIONS HELD BY Byzantine Empire \(BYZ\)/);
+    assert.match(block, /REGIONS HELD BY Bulgaria \(BGR\)/);
+    assert.match(block, /- Plovdiv \[BGR\.5_1\]/);
+  });
+});
+
+describe("buildRepairCandidates", () => {
+  it("offers the fromCode polity's holdings plus token-sharing catalog regions", () => {
+    const candidates = buildRepairCandidates(
+      { regionName: "the Philadelphia theme", fromCode: "BYZ", toCode: "BGR" },
+      { regions: REGIONS, ownership: OWNERSHIP },
+    );
+    const ids = candidates.map((c) => c.id);
+    // All BYZ holdings appear, and the token match ("Philadelphia") is present.
+    assert.ok(ids.includes("TUR.8_1"));
+    assert.ok(ids.includes("GRC.1_1"));
+  });
+
+  it("dedupes by id and still works with no fromCode (token match only)", () => {
+    const candidates = buildRepairCandidates(
+      { regionName: "Denizli district", toCode: "BGR" },
+      { regions: REGIONS, ownership: OWNERSHIP },
+    );
+    const ids = candidates.map((c) => c.id);
+    assert.deepEqual(ids, ["TUR.20_1"]); // only the token match, once
+  });
+
+  it("returns nothing for an entry with no name and no fromCode", () => {
+    assert.deepEqual(buildRepairCandidates({ toCode: "BGR" }, { regions: REGIONS }), []);
+  });
+});
+
+describe("mergeRepairedTransfers", () => {
+  it("keeps resolved originals and swaps in repairs per event index", () => {
+    const original = [
+      { eventIndex: 0, regionTransfers: [{ regionName: "Aydın", toCode: "BGR" }, { regionName: "Nowhere", toCode: "BGR" }] },
+      { eventIndex: 1, regionTransfers: [{ regionName: "Somewhere", toCode: "SRB" }] },
+    ];
+    const resolvedByIndex = new Map([[0, [{ regionName: "Aydın", toCode: "BGR" }]]]); // event 0 kept one original
+    const repairEntries = [
+      { eventIndex: 0, regionTransfers: [{ regionId: "TUR.20_1", toCode: "BGR" }] },
+    ];
+    const merged = mergeRepairedTransfers(original, resolvedByIndex, repairEntries);
+    // Event 0: kept original + repair; the unresolved "Nowhere" is dropped.
+    assert.deepEqual(merged[0].regionTransfers, [
+      { regionName: "Aydın", toCode: "BGR" },
+      { regionId: "TUR.20_1", toCode: "BGR" },
+    ]);
+    // Event 1 was not in the repair reply — untouched.
+    assert.deepEqual(merged[1].regionTransfers, [{ regionName: "Somewhere", toCode: "SRB" }]);
+  });
+
+  it("replaces all transfers when an event had no resolved originals", () => {
+    const original = [{ eventIndex: 4, regionTransfers: [{ regionName: "Ghost", toCode: "BGR" }] }];
+    const repairEntries = [{ eventIndex: 4, regionTransfers: [{ regionId: "TUR.8_1", toCode: "BGR" }] }];
+    const merged = mergeRepairedTransfers(original, new Map(), repairEntries);
+    assert.deepEqual(merged[4 - 4].regionTransfers, [{ regionId: "TUR.8_1", toCode: "BGR" }]);
+  });
+
+  it("accepts an object map or array for resolvedByIndex and leaves unmatched events alone", () => {
+    const original = [{ eventIndex: 2, regionTransfers: [{ regionName: "X", toCode: "BGR" }] }];
+    const merged = mergeRepairedTransfers(original, { 2: [] }, []); // empty repair reply
+    assert.deepEqual(merged[0].regionTransfers, [{ regionName: "X", toCode: "BGR" }]);
   });
 });
